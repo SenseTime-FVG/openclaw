@@ -417,6 +417,8 @@ export const OpenClawSchema = z
             includeMessages: z.boolean().optional(),
             includePrompt: z.boolean().optional(),
             includeSystem: z.boolean().optional(),
+            includeTools: z.boolean().optional(),
+            stages: z.string().optional(),
           })
           .strict()
           .optional(),
