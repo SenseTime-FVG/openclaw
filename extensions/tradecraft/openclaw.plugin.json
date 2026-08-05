@@ -1,0 +1,40 @@
+{
+  "id": "tradecraft",
+  "name": "TradeCraft",
+  "description": "Multi-agent resource trading game for RL training — 6 resources, building investment, bilateral trading.",
+  "enabledByDefault": false,
+  "activation": {
+    "onStartup": false,
+    "onAgentHarnesses": ["openclaw_agent"]
+  },
+  "contracts": {
+    "tools": ["tradecraft"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "socketPath": {
+        "type": "string",
+        "default": "/tmp/tradecraft.sock",
+        "description": "Unix socket path for the TradeCraft game engine."
+      },
+      "playerId": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Player identity (0 or 1). Defaults to TRADECRAFT_PLAYER_ID env var."
+      }
+    }
+  },
+  "uiHints": {
+    "socketPath": {
+      "label": "Socket Path",
+      "help": "Unix socket path for the TradeCraft game engine daemon."
+    },
+    "playerId": {
+      "label": "Player ID",
+      "help": "Which player this agent controls (0 or 1)."
+    }
+  }
+}
