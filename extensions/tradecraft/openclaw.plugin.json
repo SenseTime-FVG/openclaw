@@ -1,14 +1,20 @@
 {
   "id": "tradecraft",
   "name": "TradeCraft",
-  "description": "Multi-agent resource trading game for RL training — 6 resources, building investment, bilateral trading.",
+  "description": "Multi-agent hex-map resource trading game for autonomous OpenClaw agents.",
   "enabledByDefault": false,
   "activation": {
-    "onStartup": false,
-    "onAgentHarnesses": ["openclaw_agent"]
+    "onStartup": true
   },
   "contracts": {
-    "tools": ["tradecraft"]
+    "tools": [
+      "tradecraft_view_game_state",
+      "tradecraft_build",
+      "tradecraft_propose_trade",
+      "tradecraft_respond_trade",
+      "tradecraft_send_message",
+      "tradecraft_claim_project"
+    ]
   },
   "configSchema": {
     "type": "object",
@@ -22,8 +28,8 @@
       "playerId": {
         "type": "integer",
         "minimum": 0,
-        "maximum": 1,
-        "description": "Player identity (0 or 1). Defaults to TRADECRAFT_PLAYER_ID env var."
+        "maximum": 3,
+        "description": "Player identity (0-3, within the engine's configured player count). Defaults to TRADECRAFT_PLAYER_ID env var."
       }
     }
   },
@@ -34,7 +40,7 @@
     },
     "playerId": {
       "label": "Player ID",
-      "help": "Which player this agent controls (0 or 1)."
+      "help": "Which player this agent controls (0-3)."
     }
   }
 }

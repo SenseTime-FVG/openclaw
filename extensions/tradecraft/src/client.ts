@@ -2,9 +2,8 @@
  * Unix socket client for the TradeCraft Python game engine.
  *
  * Maintains a persistent connection to the engine. Each tool call sends a
- * request and waits for the response on the same socket. The engine handles
- * turn-blocking transparently: if it's not this player's turn, the response
- * is deferred until the turn returns, with accumulated opponent actions.
+ * request and waits for the response on the same socket. The engine rejects
+ * turn-gated actions immediately when they are called out of turn.
  *
  * Protocol: newline-delimited JSON over Unix domain socket.
  */
@@ -27,20 +26,27 @@ export interface EngineResponse {
  * Persistent socket client for the TradeCraft engine.
  *
  * Opens one long-lived connection. Each call to `request()` sends a message
- * and waits for the matching response. The engine may block (defer) the
- * response when it's not this player's turn — the client just waits.
+ * and waits for the matching response. Calls are serialized because the
+ * protocol has no request id.
  */
 export class TradeCraftClient {
   private socket: Socket | null = null;
-  private socketPath: string;
+  private connectPromise: Promise<Socket> | null = null;
+  private requestTail: Promise<void> = Promise.resolve();
   private responseQueue: Array<{
     resolve: (value: EngineResponse) => void;
     reject: (reason: Error) => void;
   }> = [];
   private recvBuf = "";
 
-  constructor(socketPath: string) {
-    this.socketPath = socketPath;
+  constructor(
+    private readonly socketPath: string,
+    private readonly playerId: number,
+  ) {}
+
+  /** Establish the player registration eagerly during plugin startup. */
+  async start(): Promise<void> {
+    await this.ensureConnected();
   }
 
   /** Ensure the socket is connected. */
@@ -48,24 +54,50 @@ export class TradeCraftClient {
     if (this.socket && !this.socket.destroyed) {
       return this.socket;
     }
-    return this.connect();
+    if (!this.connectPromise) {
+      this.connectPromise = this.connect().finally(() => {
+        this.connectPromise = null;
+      });
+    }
+    return this.connectPromise;
   }
 
   /** Open a new connection. */
   private connect(): Promise<Socket> {
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.socketPath);
+      let registered = false;
+      const registration = {
+        resolve: (response: EngineResponse) => {
+          clearTimeout(timer);
+          if (response.ok) {
+            registered = true;
+            resolve(socket);
+          } else {
+            socket.destroy();
+            reject(new Error(response.error ?? "Player registration failed"));
+          }
+        },
+        reject,
+      };
       const timer = setTimeout(() => {
+        this.removeQueuedResponse(registration);
         socket.destroy();
-        reject(
-          new Error(`TradeCraft engine connection timed out (${this.socketPath})`),
-        );
+        reject(new Error(`TradeCraft engine connection timed out (${this.socketPath})`));
       }, 10000);
 
       socket.on("connect", () => {
-        clearTimeout(timer);
         this.socket = socket;
-        resolve(socket);
+        this.recvBuf = "";
+        // Complete identity registration before the first action is sent. This
+        // avoids assigning players by nondeterministic connection order.
+        this.responseQueue.push(registration);
+        socket.write(
+          JSON.stringify({
+            action: "register_player",
+            params: { player_id: this.playerId },
+          }) + "\n",
+        );
       });
 
       socket.on("data", (chunk: Buffer) => {
@@ -75,22 +107,30 @@ export class TradeCraftClient {
 
       socket.on("error", (err: Error & { code?: string }) => {
         clearTimeout(timer);
-        this.socket = null;
+        const isCurrentSocket = this.socket === socket;
+        if (isCurrentSocket) {
+          this.socket = null;
+        }
         if (err.code === "ENOENT" || err.code === "ECONNREFUSED") {
-          reject(
-            new Error(
-              `TradeCraft engine not running at ${this.socketPath}: ${err.message}`,
-            ),
-          );
+          reject(new Error(`TradeCraft engine not running at ${this.socketPath}: ${err.message}`));
         } else {
           reject(err);
         }
-        // Reject any queued requests
-        this.flushQueue(err);
+        if (isCurrentSocket) {
+          this.flushQueue(err);
+        }
       });
 
       socket.on("close", () => {
-        this.socket = null;
+        clearTimeout(timer);
+        const isCurrentSocket = this.socket === socket;
+        if (isCurrentSocket) {
+          this.socket = null;
+          this.flushQueue(new Error("TradeCraft engine closed the socket"));
+        }
+        if (!registered) {
+          reject(new Error("TradeCraft engine closed before player registration completed"));
+        }
       });
     });
   }
@@ -129,20 +169,32 @@ export class TradeCraftClient {
     }
   }
 
+  private removeQueuedResponse(target: (typeof this.responseQueue)[number]): void {
+    const index = this.responseQueue.indexOf(target);
+    if (index >= 0) {
+      this.responseQueue.splice(index, 1);
+    }
+  }
+
   /**
    * Send a request to the engine and wait for the response.
-   * May block for an extended period if it's not this player's turn —
-   * the engine defers the response until the turn returns.
+   * Requests are serialized because the wire protocol has no request ids and
+   * matches responses to calls by FIFO order.
    */
-  async request(
-    action: string,
-    params: Record<string, unknown>,
-  ): Promise<EngineResponse> {
-    const socket = await this.ensureConnected();
-    return new Promise((resolve, reject) => {
-      this.responseQueue.push({ resolve, reject });
-      socket.write(JSON.stringify({ action, params }) + "\n");
-    });
+  async request(action: string, params: Record<string, unknown>): Promise<EngineResponse> {
+    const run = async (): Promise<EngineResponse> => {
+      const socket = await this.ensureConnected();
+      return new Promise((resolve, reject) => {
+        this.responseQueue.push({ resolve, reject });
+        socket.write(JSON.stringify({ action, params }) + "\n");
+      });
+    };
+    const pending = this.requestTail.then(run, run);
+    this.requestTail = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
   }
 
   /** Close the connection. */
@@ -154,19 +206,49 @@ export class TradeCraftClient {
   }
 }
 
+const SHARED_CLIENTS_KEY = "__openclawTradeCraftClients";
+
+type TradeCraftGlobal = typeof globalThis & {
+  [SHARED_CLIENTS_KEY]?: Map<string, TradeCraftClient>;
+};
+
+/**
+ * Reuse the engine connection when Gateway startup and agent-runtime prewarm
+ * load the plugin in separate registries within the same process.
+ */
+export function getSharedTradeCraftClient(socketPath: string, playerId: number): TradeCraftClient {
+  const host = globalThis as TradeCraftGlobal;
+  const clients = host[SHARED_CLIENTS_KEY] ?? new Map<string, TradeCraftClient>();
+  host[SHARED_CLIENTS_KEY] = clients;
+
+  const key = `${socketPath}\u0000${playerId}`;
+  const existing = clients.get(key);
+  if (existing) {
+    return existing;
+  }
+
+  const client = new TradeCraftClient(socketPath, playerId);
+  clients.set(key, client);
+  return client;
+}
+
 /**
  * Determine player identity from config or environment.
  */
-export function resolvePlayerId(
-  pluginConfig?: Record<string, unknown>,
-): number {
-  if (pluginConfig && typeof pluginConfig.playerId === "number") {
-    return pluginConfig.playerId as number;
+export function resolvePlayerId(pluginConfig?: Record<string, unknown>): number {
+  if (
+    pluginConfig &&
+    typeof pluginConfig.playerId === "number" &&
+    Number.isInteger(pluginConfig.playerId) &&
+    pluginConfig.playerId >= 0 &&
+    pluginConfig.playerId <= 3
+  ) {
+    return pluginConfig.playerId;
   }
   const envVal = process.env.TRADECRAFT_PLAYER_ID;
   if (envVal !== undefined) {
     const parsed = parseInt(envVal, 10);
-    if (!isNaN(parsed) && (parsed === 0 || parsed === 1)) {
+    if (!isNaN(parsed) && parsed >= 0 && parsed <= 3) {
       return parsed;
     }
   }
@@ -176,9 +258,7 @@ export function resolvePlayerId(
 /**
  * Resolve the socket path from config or fall back to default.
  */
-export function resolveSocketPath(
-  pluginConfig?: Record<string, unknown>,
-): string {
+export function resolveSocketPath(pluginConfig?: Record<string, unknown>): string {
   if (pluginConfig && typeof pluginConfig.socketPath === "string") {
     return pluginConfig.socketPath as string;
   }

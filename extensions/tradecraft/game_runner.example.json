@@ -1,0 +1,25 @@
+{
+  "gameId": "",
+  "maxAgentCalls": 200,
+  "maxAgentCallsWithoutProgress": 3,
+  "mode": "mock",
+  "openclaw": {
+    "agentId": "main",
+    "agentRetryAttempts": 3,
+    "agentRetryBaseSeconds": 5,
+    "agentRetryMaxSeconds": 60,
+    "agentTimeoutSeconds": 600,
+    "apiKeyEnv": "",
+    "apiKeyEnvs": [],
+    "basePort": 18789,
+    "configOverlay": {},
+    "gatewayStartupSeconds": 90,
+    "model": "",
+    "portStep": 20,
+    "rateLimitMaxWaitSeconds": 3600,
+    "rateLimitRetrySeconds": 120,
+    "thinking": "low"
+  },
+  "players": 3,
+  "seed": 42
+}

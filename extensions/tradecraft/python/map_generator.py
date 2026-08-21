@@ -26,9 +26,11 @@ CUBE_DIRS = [(1,-1,0),(1,0,-1),(0,1,-1),(-1,1,0),(-1,0,1),(0,-1,1)]
 CORNER_OFFSETS = [(2,-1,-1),(1,1,-2),(-1,2,-1),(-2,1,1),(-1,-1,2),(1,-2,1)]
 
 
-def _offset_to_cube(r, c):
-    x = c - (r - (r & 1)) // 2
-    z = r
+def _board_to_cube(r, c):
+    """Map a local row/column to the centered radius-2 board."""
+    radius = len(HEX_ROWS) // 2
+    x = c - min(r, radius)
+    z = r - radius
     return (x, -x - z, z)
 
 
@@ -147,7 +149,7 @@ def generate_map(seed=42):
             res = resources[hidx]
             num = numbers[num_idx] if res != DESERT else None
             if res != DESERT: num_idx += 1
-            cube = _offset_to_cube(r, c)
+            cube = _board_to_cube(r, c)
             hexes.append(HexTile(id=f"h{hidx}", row=r, col=c, resource=res,
                                  number=num, cube=cube))
             hex_cubes[cube] = hidx
@@ -156,7 +158,8 @@ def generate_map(seed=42):
     # Build topology
     vertices, edges = _build_topology(hex_cubes)
 
-    dice_seq = [rng.randint(2, 12) for _ in range(TOTAL_ROUNDS)]
+    dice_seq = [rng.randint(1, 6) + rng.randint(1, 6)
+                for _ in range(TOTAL_ROUNDS)]
 
     return GameMap(hexes=hexes, vertices=vertices, edges=edges, seed=seed,
                    dice_sequence=dice_seq)

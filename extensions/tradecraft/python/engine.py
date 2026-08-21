@@ -17,6 +17,7 @@ import os
 import random
 import socket
 import sys
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,6 +52,15 @@ class TradeProposal:
 
 
 @dataclass
+class PlayerMessage:
+    message_id: int
+    sender: int
+    recipients: list[int]
+    content: str
+    round_num: int
+
+
+@dataclass
 class GameState:
     players: list[PlayerState]
     game_map: GameMap
@@ -63,7 +73,9 @@ class GameState:
     phase: str = "placement"
     placement_round: int = 0
     placement_done: bool = False
+    placement_vertex: Optional[str] = None
     current_dice_roll: int = 0
+    messages: list[PlayerMessage] = field(default_factory=list)
 
 
 # ── Engine ─────────────────────────────────────────────────────────────────
@@ -85,49 +97,68 @@ class TradeCraftEngine:
         self._dice_idx = 0
 
     def handle_action(self, action: str, params: dict, player_id: int) -> dict:
+        if player_id < 0 or player_id >= self.state.num_players:
+            return {"ok": False, "error": f"Invalid player: P{player_id}."}
+
+        # Viewing the final state remains available after the game ends.
+        if action == "view_game_state":
+            return {"ok": True, "result": self._view_game_state(player_id, include_map=True)}
         if self.state.game_over:
             return {"ok": False, "error": "Game is already over."}
 
         player = self.state.players[player_id]
 
         # Universal tools
-        if action == "view_game_state":
-            return {"ok": True, "result": self._view_game_state(player_id)}
         if action == "respond_trade":
-            return self._respond_trade(player, params, player_id)
+            return self._with_action_state(
+                self._respond_trade(player, params, player_id), player_id
+            )
 
         # Turn checks for placement phase
         if self.state.phase == "placement":
-            return self._handle_placement(action, params, player_id, player)
+            return self._with_action_state(
+                self._handle_placement(action, params, player_id, player), player_id
+            )
 
         # Turn checks for play phase
         if action in ("build", "propose_trade", "send_message", "claim_project"):
             if player_id != self.state.current_player:
                 return {"ok": False, "error": f"Not your turn. Current: P{self.state.current_player}."}
+            if player.actions_used >= ACTIONS_PER_ROUND:
+                return {"ok": False, "error": "All turn actions are used; resolve the pending trade."}
 
         if action == "build":
-            return self._build(player, params, player_id)
+            result = self._build(player, params, player_id)
         elif action == "propose_trade":
-            return self._propose_trade(player, params, player_id)
+            result = self._propose_trade(player, params, player_id)
         elif action == "send_message":
-            return self._send_message(player, params, player_id)
+            result = self._send_message(player, params, player_id)
         elif action == "claim_project":
-            return self._claim_project(player, params, player_id)
+            result = self._claim_project(player, params, player_id)
         else:
             return {"ok": False, "error": f"Unknown action: {action}"}
+        return self._with_action_state(result, player_id)
+
+    def _with_action_state(self, result: dict, player_id: int) -> dict:
+        """Attach one post-action dynamic snapshot without repeating the static map."""
+        if result.get("ok") and isinstance(result.get("result"), dict):
+            result["result"]["state"] = self._view_game_state(
+                player_id, include_map=False
+            )
+        return result
 
     # ── Placement Phase ────────────────────────────────────────────────
 
+    def _placement_player(self) -> int:
+        """Return the player expected by the current snake-draft step."""
+        player_count = self.state.num_players
+        if self.state.placement_round < player_count:
+            return self.state.placement_round
+        return 2 * player_count - 1 - self.state.placement_round
+
     def _handle_placement(self, action: str, params: dict, player_id: int, player: PlayerState) -> dict:
         """Initial placement: snake draft."""
-        N = self.state.num_players
-        total_rounds = 2 * N
-
-        # Snake order: 0,1,2,...,N-1,N-1,N-2,...,0
-        if self.state.placement_round < N:
-            expected = self.state.placement_round
-        else:
-            expected = total_rounds - 1 - self.state.placement_round
+        expected = self._placement_player()
 
         if player_id != expected:
             return {"ok": False, "error": f"Placement round {self.state.placement_round}: waiting for P{expected}."}
@@ -143,6 +174,7 @@ class TradeCraftEngine:
             result = self._build_settlement(player, vid, placement=True)
             if result["ok"]:
                 self.state.placement_done = True
+                self.state.placement_vertex = vid
                 vertex = self.game_map.vertex_by_id(vid)
                 self._grant_initial_resources(player, vertex)
                 result["result"]["phase"] = self.state.phase
@@ -155,12 +187,15 @@ class TradeCraftEngine:
                 # Both settlement and road placed → advance
                 self.state.placement_round += 1
                 self.state.placement_done = False
+                self.state.placement_vertex = None
                 if self.state.placement_round >= 2 * self.state.num_players:
                     self.state.phase = "play"
                     self.state.current_player = 0
                     self.state.round_num = 1
                     # Roll first dice and distribute resources
                     self._start_round()
+                else:
+                    self.state.current_player = self._placement_player()
                 result["result"]["phase"] = self.state.phase
             return result
         else:
@@ -232,7 +267,7 @@ class TradeCraftEngine:
         if edge_id not in {e.id for e in self.game_map.edges}:
             return {"ok": False, "error": f"Invalid edge: {edge_id}"}
 
-        if edge_id in player.roads:
+        if any(edge_id in p.roads for p in self.state.players):
             return {"ok": False, "error": "Road already exists here."}
 
         # Check max roads
@@ -243,9 +278,10 @@ class TradeCraftEngine:
 
         # Road must connect to existing road or building
         if self.state.phase == "placement":
-            # During placement: must connect to settlement just placed
-            # Simplified: accept any road adjacent to a player building
-            has_adj = (edge.v1 in player.buildings or edge.v2 in player.buildings)
+            # During placement the road belongs to the settlement placed in
+            # this snake-draft step, not an older part of the player's network.
+            placed_vertex = self.state.placement_vertex
+            has_adj = placed_vertex is not None and placed_vertex in (edge.v1, edge.v2)
             if not has_adj:
                 return {"ok": False, "error": "Road must connect to your settlement."}
         else:
@@ -266,26 +302,23 @@ class TradeCraftEngine:
         player.roads.add(edge_id)
         if self.state.phase == "play":
             self._consume_action(player)
-        return {"ok": True, "result": {"built": "road", "edge_id": edge_id,
-                                        "state": self._view_game_state(player.player_id)}}
+        return {"ok": True, "result": {"built": "road", "edge_id": edge_id}}
 
     def _build_settlement(self, player: PlayerState, vertex_id: str, placement: bool = False) -> dict:
         """Place a settlement on a vertex."""
         if vertex_id not in {v.id for v in self.game_map.vertices}:
             return {"ok": False, "error": f"Invalid vertex: {vertex_id}"}
 
-        if player.player_id in [pid for pid, _ in self._vertex_owners(vertex_id)]:
-            return {"ok": False, "error": "You already have a building here."}
+        if self._vertex_owners(vertex_id):
+            return {"ok": False, "error": "A building already exists here."}
 
         # Check max settlements
         if len(player.buildings) >= MAX_SETTLEMENTS:
             return {"ok": False, "error": f"Max {MAX_SETTLEMENTS} settlements reached."}
 
-        # Distance rule
-        if not placement:
-            vertex = self.game_map.vertex_by_id(vertex_id)
-            if not self._check_distance(vertex_id):
-                return {"ok": False, "error": "Too close to other buildings (min 2 edges)."}
+        # Distance applies during both initial placement and normal play.
+        if not self._check_distance(vertex_id):
+            return {"ok": False, "error": "Too close to other buildings (min 2 edges)."}
 
         # Road connectivity (not checked during initial placement)
         if not placement:
@@ -308,8 +341,7 @@ class TradeCraftEngine:
 
         player.buildings[vertex_id] = 1
         return {"ok": True, "result": {"built": "settlement", "vertex_id": vertex_id,
-                                        "level": 1,
-                                        "state": self._view_game_state(player.player_id)}}
+                                        "level": 1}}
 
     def _upgrade_building(self, player: PlayerState, vertex_id: str, to_level: int) -> dict:
         """Upgrade a settlement to city (L1→L2) or city to metropolis (L2→L3)."""
@@ -321,6 +353,10 @@ class TradeCraftEngine:
             return {"ok": False, "error": f"Can only upgrade from {current_level} to {current_level+1}."}
         if to_level > 3:
             return {"ok": False, "error": "Max level is 3."}
+        if current_level == 1:
+            city_count = sum(1 for level in player.buildings.values() if level >= 2)
+            if city_count >= MAX_CITIES:
+                return {"ok": False, "error": f"Max {MAX_CITIES} cities reached."}
 
         if current_level == 1:
             cost = {"crystal": 2, "iron": 1}
@@ -333,14 +369,18 @@ class TradeCraftEngine:
 
         player.buildings[vertex_id] = to_level
         return {"ok": True, "result": {"built": "upgrade", "vertex_id": vertex_id,
-                                        "level": to_level,
-                                        "state": self._view_game_state(player.player_id)}}
+                                        "level": to_level}}
 
     def _check_distance(self, vertex_id: str) -> bool:
         """Check distance rule: no other building within 2 edges."""
+        if self._vertex_owners(vertex_id):
+            return False
+
         visited = {vertex_id}
         fringe = {vertex_id}
-        for _ in range(MIN_SETTLEMENT_DISTANCE):
+        # Distances below the configured minimum are forbidden. With the
+        # default of 2, adjacent vertices are rejected and distance 2 is legal.
+        for _ in range(1, MIN_SETTLEMENT_DISTANCE):
             new_fringe = set()
             for vid in fringe:
                 v = self.game_map.vertex_by_id(vid)
@@ -369,8 +409,9 @@ class TradeCraftEngine:
         offer = params.get("offer", {})
         request = params.get("request", {})
 
-        if not offer or not request:
-            return {"ok": False, "error": "Must specify offer and request."}
+        validation_error = self._validate_trade_maps(offer, request)
+        if validation_error:
+            return {"ok": False, "error": validation_error}
         if self.state.pending_trade is not None:
             return {"ok": False, "error": "Trade negotiation already in progress."}
 
@@ -378,7 +419,12 @@ class TradeCraftEngine:
             if player.resources.get(r, 0) < n:
                 return {"ok": False, "error": f"Insufficient {r}: have {player.resources.get(r,0)}, offering {n}."}
 
-        target_id = params.get("target", (player_id + 1) % self.state.num_players); opponent = self.state.players[target_id]
+        target_id = params.get("target", (player_id + 1) % self.state.num_players)
+        if isinstance(target_id, bool) or not isinstance(target_id, int):
+            return {"ok": False, "error": "Trade target must be an integer player id."}
+        if target_id < 0 or target_id >= self.state.num_players or target_id == player_id:
+            return {"ok": False, "error": f"Invalid trade target: P{target_id}."}
+        opponent = self.state.players[target_id]
         for r, n in request.items():
             if opponent.resources.get(r, 0) < n:
                 return {"ok": False, "error": f"Opponent has insufficient {r}."}
@@ -389,46 +435,58 @@ class TradeCraftEngine:
 
         self._consume_action(player)
         return {"ok": True, "result": {
-            "trade_proposed": {"proposer": player_id, "offer": offer, "request": request},
-            "state": self._view_game_state(player_id)}}
+            "trade_proposed": {"proposer": player_id, "offer": offer, "request": request}}}
 
     def _respond_trade(self, player: PlayerState, params: dict, player_id: int) -> dict:
         action = params.get("action", "")
+        message = params.get("message", "")
+        pt = self.state.pending_trade
         if pt is None:
             return {"ok": False, "error": "No pending trade."}
 
         # Only proposer and responder can act on the trade
         if player_id not in (pt.proposer, pt.responder):
             return {"ok": False, "error": "You are not involved in this trade."}
+        if not isinstance(message, str) or not message.strip():
+            return {"ok": False, "error": "Trade response message required."}
+
+        other_id = pt.responder if player_id == pt.proposer else pt.proposer
 
         if action == "accept":
             if pt.proposer == player_id:
                 return {"ok": False, "error": "Cannot accept your own proposal."}
-            return self._execute_trade(player_id)
+            result = self._execute_trade(player_id)
         elif action == "reject":
             self.state.pending_trade = None
-            return {"ok": True, "result": {"trade_rejected": True,
-                    "state": self._view_game_state(player_id)}}
+            result = {"ok": True, "result": {"trade_rejected": True}}
         elif action == "counter":
             # Reject current, create new proposal with swapped roles
             offer = params.get("offer", {})
             request = params.get("request", {})
-            if not offer or not request:
-                return {"ok": False, "error": "Must specify offer and request."}
+            validation_error = self._validate_trade_maps(offer, request)
+            if validation_error:
+                return {"ok": False, "error": validation_error}
             for r, n in offer.items():
                 if player.resources.get(r, 0) < n:
                     return {"ok": False, "error": f"Insufficient {r}."}
-            other_id = params.get("target", (player_id + 1) % self.state.num_players); other = self.state.players[other_id]
+            other_id = pt.proposer if player_id == pt.responder else pt.responder
+            other = self.state.players[other_id]
             for r, n in request.items():
                 if other.resources.get(r, 0) < n:
                     return {"ok": False, "error": f"Opponent has insufficient {r}."}
             self.state.pending_trade = TradeProposal(
                 proposer=player_id, responder=other_id,
                 offer=dict(offer), request=dict(request))
-            return {"ok": True, "result": {"trade_countered": {"offer": offer, "request": request},
-                    "state": self._view_game_state(player_id)}}
+            result = {"ok": True, "result": {
+                "trade_countered": {"offer": offer, "request": request}}}
         else:
             return {"ok": False, "error": f"Unknown trade response: {action}"}
+
+        if result.get("ok"):
+            feedback = self._record_message(player_id, [other_id], message)
+            result["result"]["response_message"] = self._message_view(feedback)
+        self._advance_turn_if_ready()
+        return result
 
     def _execute_trade(self, player_id: int) -> dict:
         pt = self.state.pending_trade
@@ -456,19 +514,46 @@ class TradeCraftEngine:
         receiver.trades_completed += 1
         self.state.pending_trade = None
 
-        return {"ok": True, "result": {"trade_accepted": {"offer": pt.offer, "request": pt.request},
-                "state": self._view_game_state(player_id)}}
+        return {"ok": True, "result": {
+            "trade_accepted": {"offer": pt.offer, "request": pt.request}}}
 
     # ── Messages & Projects ────────────────────────────────────────────
 
+    @staticmethod
+    def _message_view(message: PlayerMessage) -> dict:
+        return {
+            "id": message.message_id,
+            "from": message.sender,
+            "recipients": list(message.recipients),
+            "content": message.content,
+            "round": message.round_num,
+        }
+
+    def _record_message(
+        self, player_id: int, recipients: list[int], content: str
+    ) -> PlayerMessage:
+        message = PlayerMessage(
+            message_id=len(self.state.messages) + 1,
+            sender=player_id,
+            recipients=recipients,
+            content=content.strip(),
+            round_num=self.state.round_num,
+        )
+        self.state.messages.append(message)
+        return message
+
     def _send_message(self, player: PlayerState, params: dict, player_id: int) -> dict:
         content = params.get("content", "")
-        if not content:
+        if not isinstance(content, str) or not content.strip():
             return {"ok": False, "error": "Message content required."}
+        message = self._record_message(
+            player_id,
+            [pid for pid in range(self.state.num_players) if pid != player_id],
+            content,
+        )
         self._consume_action(player)
         return {"ok": True, "result": {
-            "message_sent": {"from": player_id, "content": content},
-            "state": self._view_game_state(player_id)}}
+            "message_sent": self._message_view(message)}}
 
     def _claim_project(self, player: PlayerState, params: dict, player_id: int) -> dict:
         pid = params.get("project_id", "")
@@ -496,30 +581,31 @@ class TradeCraftEngine:
 
         player.projects.append({"id": pid, "name": project["name"], "points": project["points"]})
         self._consume_action(player)
-        return {"ok": True, "result": {"claimed": pid, "state": self._view_game_state(player_id)}}
+        return {"ok": True, "result": {"claimed": pid}}
 
     def _longest_road(self, player: PlayerState) -> int:
         """Compute the longest continuous road for a player."""
         if not player.roads:
             return 0
-        # Build adjacency graph of player's roads
-        graph = defaultdict(set)
+        # Build an edge-labelled graph so the score counts road segments, not
+        # visited vertices, and still handles branches and cycles correctly.
+        graph = defaultdict(list)
         for eid in player.roads:
             e = self.game_map.edge_by_id(eid)
-            graph[e.v1].add(e.v2)
-            graph[e.v2].add(e.v1)
+            graph[e.v1].append((eid, e.v2))
+            graph[e.v2].append((eid, e.v1))
 
         # DFS to find longest path
         best = 0
-        def dfs(node, visited):
+        def dfs(node, used_edges):
             nonlocal best
-            best = max(best, len(visited))
-            for nb in graph[node]:
-                if nb not in visited:
-                    dfs(nb, visited | {nb})
+            best = max(best, len(used_edges))
+            for eid, nb in graph[node]:
+                if eid not in used_edges:
+                    dfs(nb, used_edges | {eid})
 
         for start in graph:
-            dfs(start, {start})
+            dfs(start, set())
         return best
 
     def _hex_diversity(self, player: PlayerState) -> int:
@@ -540,15 +626,26 @@ class TradeCraftEngine:
         if player.actions_used >= ACTIONS_PER_ROUND:
             self._end_turn(player.player_id)
 
+    def _advance_turn_if_ready(self):
+        # The last player can finish their actions while a trade is pending.
+        # Release that deferred round transition once negotiation resolves.
+        player = self.state.players[self.state.current_player]
+        if (player.actions_used >= ACTIONS_PER_ROUND
+                and self.state.pending_trade is None):
+            self._end_turn(player.player_id)
+
     def _end_turn(self, player_id: int):
         N = self.state.num_players; next_player = (player_id + 1) % N
         if next_player == 0:
+            # Dice production and final scoring must use the inventories after
+            # the last player's pending trade has been resolved.
+            if self.state.pending_trade is not None:
+                return
             self.state.round_num += 1
             if self.state.round_num > TOTAL_ROUNDS:
                 self._end_game()
                 return
             self._start_round()
-            self.state.pending_trade = None
         else:
             for p in self.state.players:
                 p.actions_used = 0
@@ -572,26 +669,112 @@ class TradeCraftEngine:
 
     # ── Helpers ────────────────────────────────────────────────────────
 
+    def _required_gold(self, resources: dict, cost: dict) -> int:
+        explicit_gold = cost.get(GOLD_RESOURCE, 0)
+        substitution_gold = sum(
+            max(0, amount - resources.get(resource, 0))
+            for resource, amount in cost.items()
+            if resource != GOLD_RESOURCE
+        )
+        return explicit_gold + substitution_gold
+
     def _can_afford(self, resources: dict, cost: dict) -> bool:
-        gold = resources.get("gold", 0)
-        deficit = sum(max(0, n - resources.get(r, 0)) for r, n in cost.items())
-        return deficit <= gold
+        return self._required_gold(resources, cost) <= resources.get(GOLD_RESOURCE, 0)
 
     def _deduct_cost(self, resources: dict, cost: dict):
-        gold = resources.get("gold", 0)
-        for r, n in cost.items():
-            have = resources.get(r, 0)
-            if have >= n:
-                resources[r] = have - n
-            else:
-                shortfall = n - have
-                resources[r] = 0
-                gold -= shortfall
-        resources["gold"] = gold
+        gold_spent = self._required_gold(resources, cost)
+        for resource, amount in cost.items():
+            if resource != GOLD_RESOURCE:
+                resources[resource] = max(0, resources.get(resource, 0) - amount)
+        resources[GOLD_RESOURCE] = resources.get(GOLD_RESOURCE, 0) - gold_spent
+
+    def _validate_trade_maps(self, offer: object, request: object) -> Optional[str]:
+        """Validate engine-bound resource maps independently of tool schemas."""
+        valid_resources = set(RESOURCES + [GOLD_RESOURCE])
+        for label, resource_map in (("offer", offer), ("request", request)):
+            if not isinstance(resource_map, dict) or not resource_map:
+                return f"Must specify a non-empty {label}."
+            for resource, amount in resource_map.items():
+                if resource not in valid_resources:
+                    return f"Unknown resource in {label}: {resource}."
+                if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+                    return f"{label}.{resource} must be a positive integer."
+        return None
 
     # ── State Serialization ────────────────────────────────────────────
 
-    def _view_game_state(self, player_id: int) -> dict:
+    def _compact_map_view(self) -> dict:
+        return {
+            "hexes": {
+                h.id: [h.resource, h.number]
+                for h in self.game_map.hexes
+            },
+            "vertices": {
+                v.id: list(v.hexes)
+                for v in self.game_map.vertices
+            },
+            "edges": {
+                e.id: [e.v1, e.v2]
+                for e in self.game_map.edges
+            },
+        }
+
+    def _expansion_targets_view(self, player_id: int) -> dict:
+        settlement_ids = []
+        road_ids = []
+        player = self.state.players[player_id]
+
+        # These are topology-only expansion targets. Never filter them by
+        # affordability: agents need unaffordable targets for resource planning.
+        if self.state.phase == "placement" and player_id == self.state.current_player:
+            if not self.state.placement_done:
+                for v in self.game_map.vertices:
+                    if not self._vertex_owners(v.id) and self._check_distance(v.id):
+                        settlement_ids.append(v.id)
+            else:
+                placed_vertex = self.state.placement_vertex
+                for e in self.game_map.edges:
+                    occupied = any(e.id in p.roads for p in self.state.players)
+                    if not occupied and placed_vertex in (e.v1, e.v2):
+                        road_ids.append(e.id)
+        elif player_id == self.state.current_player:
+            for v in self.game_map.vertices:
+                if v.id not in player.buildings:
+                    owners = [pid for pid, _ in self._vertex_owners(v.id)]
+                    if player_id not in owners and self._check_distance(v.id):
+                        connected = any(
+                            e.id in player.roads
+                            for e in self.game_map.edges
+                            if e.v1 == v.id or e.v2 == v.id
+                        )
+                        if connected:
+                            settlement_ids.append(v.id)
+            for e in self.game_map.edges:
+                if not any(e.id in p.roads for p in self.state.players):
+                    connected = (
+                        e.v1 in player.buildings or e.v2 in player.buildings or
+                        any(eid in player.roads for eid in e.adjacent_edges)
+                    )
+                    if connected:
+                        road_ids.append(e.id)
+
+        hex_by_id = {h.id: h for h in self.game_map.hexes}
+        vertex_by_id = {v.id: v for v in self.game_map.vertices}
+        edge_by_id = {e.id: e for e in self.game_map.edges}
+        settlements = {
+            vertex_id: [
+                [hex_by_id[hex_id].resource, hex_by_id[hex_id].number]
+                for hex_id in vertex_by_id[vertex_id].hexes
+            ]
+            for vertex_id in settlement_ids
+        }
+        roads = {
+            edge_id: [edge_by_id[edge_id].v1, edge_by_id[edge_id].v2]
+            for edge_id in road_ids
+        }
+        return {"settlements": settlements, "roads": roads}
+
+    def _view_game_state(self, player_id: int, include_map: bool = True) -> dict:
         players_view = []
         for p in self.state.players:
             buildings_view = []
@@ -621,52 +804,6 @@ class TradeCraftEngine:
                 "offer": dict(pt.offer), "request": dict(pt.request),
             }
 
-        hexes_view = [{"id": h.id, "resource": h.resource, "number": h.number}
-                      for h in self.game_map.hexes]
-        vertices_view = [{"id": v.id, "hexes": list(v.hexes),
-                          "adjacent_vertices": list(v.adjacent_vertices)}
-                         for v in self.game_map.vertices]
-        edges_view = [{"id": e.id, "v1": e.v1, "v2": e.v2}
-                      for e in self.game_map.edges]
-
-        # Available actions (placement phase: all vertices available, edges adjacent to buildings)
-        available_vertices = []
-        available_edges = []
-        player = self.state.players[player_id]
-
-        if self.state.phase == "placement":
-            # During placement, any vertex that passes distance check is available
-            for v in self.game_map.vertices:
-                if v.id not in player.buildings:
-                    owners = [pid for pid, _ in self._vertex_owners(v.id)]
-                    if player_id not in owners and self._check_distance(v.id):
-                        available_vertices.append(v.id)
-            # Edges adjacent to player's existing buildings
-            for e in self.game_map.edges:
-                if e.id not in player.roads:
-                    if e.v1 in player.buildings or e.v2 in player.buildings:
-                        available_edges.append(e.id)
-        elif player_id == self.state.current_player:
-            for v in self.game_map.vertices:
-                if v.id not in player.buildings:
-                    owners = [pid for pid, _ in self._vertex_owners(v.id)]
-                    if player_id not in owners and self._check_distance(v.id):
-                        connected = any(
-                            e.id in player.roads
-                            for e in self.game_map.edges
-                            if e.v1 == v.id or e.v2 == v.id
-                        )
-                        if connected:
-                            available_vertices.append(v.id)
-            for e in self.game_map.edges:
-                if e.id not in player.roads:
-                    connected = (
-                        e.v1 in player.buildings or e.v2 in player.buildings or
-                        any(eid in player.roads for eid in e.adjacent_edges)
-                    )
-                    if connected:
-                        available_edges.append(e.id)
-
         projects_view = [
             {"id": "trade_master", "name": "Trade Master", "description": "Complete 5+ trades", "points": 3,
              "claimed_by": self._project_claimed_by("trade_master")},
@@ -684,29 +821,32 @@ class TradeCraftEngine:
 
         scores = self._calculate_scores() if self.state.game_over else None
 
-        return {
+        view = {
             "round": self.state.round_num,
             "max_rounds": TOTAL_ROUNDS,
             "dice_roll": self.state.current_dice_roll,
             "phase": self.state.phase,
+            "placement_round": self.state.placement_round,
+            "placement_done": self.state.placement_done,
             "current_player": self.state.current_player,
+            "current_actions_used": self.state.players[self.state.current_player].actions_used,
             "actions_used": self.state.players[player_id].actions_used,
             "actions_per_round": ACTIONS_PER_ROUND,
             "players": players_view,
-            "map": {
-                "hexes": hexes_view,
-                "vertices": vertices_view,
-                "edges": edges_view,
-            },
+        }
+        if include_map:
+            view["map"] = self._compact_map_view()
+        view.update({
             "projects": projects_view,
             "pending_trade": pending_trade_view,
-            "available_vertices": available_vertices,
-            "available_edges": available_edges,
+            "messages": [self._message_view(message) for message in self.state.messages],
+            "expansion_targets": self._expansion_targets_view(player_id),
             "game_over": self.state.game_over,
             "winner": self.state.winner,
             "scores": scores,
             "my_player_id": player_id,
-        }
+        })
+        return view
 
     def _project_claimed_by(self, pid: str) -> Optional[int]:
         for p in self.state.players:
@@ -740,20 +880,61 @@ def send_message(conn: socket.socket, msg: dict):
     conn.sendall(data.encode("utf-8"))
 
 
-def run_server(socket_path: str, seed: int = 42):
+def _write_snapshot(path: Optional[str], engine: TradeCraftEngine, sequence: int,
+                    connected_players: list[int]):
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    state = engine._view_game_state(0)
+    state["_meta"] = {
+        "sequence": sequence,
+        "updated_at": time.time(),
+        "connected_players": sorted(connected_players),
+        "required_players": engine.num_players,
+    }
+    temporary = f"{path}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
+def _append_event(path: Optional[str], event: dict):
+    if not path:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    payload = {"timestamp": time.time(), **event}
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def run_server(socket_path: str, seed: int = 42, num_players: int = 3,
+               state_path: Optional[str] = None, event_log_path: Optional[str] = None):
     if os.path.exists(socket_path):
         os.unlink(socket_path)
 
+    engine = TradeCraftEngine(seed=seed, num_players=num_players)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(socket_path)
     os.chmod(socket_path, 0o660)
-    server.listen(2)
+    server.listen(num_players)
 
-    engine = TradeCraftEngine(seed=seed, num_players=args.players)
     conn_by_pid: dict[int, socket.socket] = {}
     pid_by_conn: dict[int, int] = {}
+    sequence = 0
 
-    print(f"[TradeCraft] Listening on {socket_path} (seed={seed})", flush=True)
+    _write_snapshot(state_path, engine, sequence, [])
+    _append_event(event_log_path, {
+        "type": "server_started",
+        "seed": seed,
+        "players": num_players,
+        "socket_path": socket_path,
+    })
+
+    print(f"[TradeCraft] Listening on {socket_path} "
+          f"(seed={seed}, players={num_players})", flush=True)
 
     try:
         import select
@@ -761,12 +942,37 @@ def run_server(socket_path: str, seed: int = 42):
             readable, _, _ = select.select([server], [], [], None)
             if server in readable:
                 conn, _ = server.accept()
-                pid = len(conn_by_pid)
+                registration = recv_message(conn)
+                params = registration.get("params", {}) if registration else {}
+                pid = params.get("player_id") if registration else None
+                valid_registration = (
+                    registration is not None
+                    and registration.get("action") == "register_player"
+                    and isinstance(pid, int)
+                    and not isinstance(pid, bool)
+                    and 0 <= pid < engine.num_players
+                    and pid not in conn_by_pid
+                )
+                if not valid_registration:
+                    send_message(conn, {
+                        "ok": False,
+                        "error": "Invalid or duplicate player registration.",
+                    })
+                    conn.close()
+                    continue
                 conn_by_pid[pid] = conn
                 pid_by_conn[id(conn)] = pid
+                send_message(conn, {"ok": True, "result": {"registered_player": pid}})
+                _write_snapshot(state_path, engine, sequence, list(conn_by_pid))
+                _append_event(event_log_path, {
+                    "type": "player_connected",
+                    "player_id": pid,
+                    "connected_players": sorted(conn_by_pid),
+                })
                 print(f"[TradeCraft] Player {pid} connected.", flush=True)
 
-        print("[TradeCraft] Both connected. Game starting.", flush=True)
+        print(f"[TradeCraft] All {engine.num_players} players connected. Game starting.",
+              flush=True)
         all_conns = list(conn_by_pid.values())
 
         while not engine.state.game_over:
@@ -782,6 +988,13 @@ def run_server(socket_path: str, seed: int = 42):
                 if msg is None:
                     print(f"[TradeCraft] Player {pid} disconnected.", flush=True)
                     engine.state.game_over = True
+                    sequence += 1
+                    _write_snapshot(state_path, engine, sequence, list(conn_by_pid))
+                    _append_event(event_log_path, {
+                        "type": "player_disconnected",
+                        "player_id": pid,
+                        "sequence": sequence,
+                    })
                     break
 
                 if "error" in msg:
@@ -791,20 +1004,37 @@ def run_server(socket_path: str, seed: int = 42):
                 action = msg.get("action", "")
                 params = msg.get("params", {})
 
-                result = engine.handle_action(action, params, pid)
+                try:
+                    result = engine.handle_action(action, params, pid)
+                except Exception as exc:
+                    result = {"ok": False, "error": f"Internal engine error: {exc}"}
+                sequence += 1
+                _write_snapshot(state_path, engine, sequence, list(conn_by_pid))
+                _append_event(event_log_path, {
+                    "type": "action",
+                    "sequence": sequence,
+                    "player_id": pid,
+                    "action": action,
+                    "params": params,
+                    "ok": result.get("ok", False),
+                    "error": result.get("error"),
+                    "phase": engine.state.phase,
+                    "round": engine.state.round_num,
+                    "current_player": engine.state.current_player,
+                    "game_over": engine.state.game_over,
+                })
                 send_message(conn, result)
 
-        # Game over
-        for pid, c in conn_by_pid.items():
-            send_message(c, {
-                "ok": True,
-                "result": {
-                    "type": "game_over",
-                    "winner": engine.state.winner,
-                    "scores": engine._calculate_scores(),
-                    "game_state": engine._view_game_state(pid),
-                },
-            })
+        # The response to the final action already contains the final state.
+        # Do not send unsolicited messages: the client protocol is FIFO and
+        # has no request ids, so a broadcast could be mistaken for a response.
+        _write_snapshot(state_path, engine, sequence, list(conn_by_pid))
+        _append_event(event_log_path, {
+            "type": "game_over",
+            "sequence": sequence,
+            "winner": engine.state.winner,
+            "scores": engine._calculate_scores(),
+        })
 
     except KeyboardInterrupt:
         pass
@@ -823,5 +1053,7 @@ if __name__ == "__main__":
     parser.add_argument("--socket", default="/tmp/tradecraft.sock")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--players", type=int, default=3, help="Number of players (3 or 4)")
+    parser.add_argument("--state-file", help="Write the latest game state as atomic JSON")
+    parser.add_argument("--event-log", help="Append engine lifecycle and action events as JSONL")
     args = parser.parse_args()
-    run_server(args.socket, args.seed)
+    run_server(args.socket, args.seed, args.players, args.state_file, args.event_log)
