@@ -5,8 +5,9 @@ import random
 from dataclasses import dataclass, field
 from typing import Optional
 
-TOTAL_ROUNDS = 10
+TOTAL_ROUNDS = 12
 ACTIONS_PER_ROUND = 2
+ACTION_LIMIT = 3
 MAX_SETTLEMENTS = 5
 MAX_CITIES = 3
 MAX_ROADS = 12
@@ -19,6 +20,7 @@ RESOURCE_POOL = (["wood"]*3 + ["stone"]*3 + ["iron"]*3
                  + ["crystal"]*3 + ["silk"]*3 + ["gold"]*2 + ["desert"]*2)
 DICE_DISTRIBUTION = [(2,1),(3,2),(4,2),(5,2),(6,2),(8,2),(9,2),(10,2),(11,1),(12,1)]
 HEX_ROWS = [3, 4, 5, 4, 3]
+RED_NUMBERS = {6, 8}  # Catan "red number" tokens: may not sit adjacent
 
 # 6 uniform neighbor directions in cube coords
 CUBE_DIRS = [(1,-1,0),(1,0,-1),(0,1,-1),(-1,1,0),(-1,0,1),(0,-1,1)]
@@ -66,9 +68,8 @@ class GameMap:
 
 def _build_topology(hex_cubes: dict[tuple, int]):
     """Build vertex and edge topology from hex cube coordinates."""
-    # Vertices: each hex has 6 corners. Dedup by (vx, vy, vz) integer triple.
-    pos_to_vid = {}  # (vx,vy,vz) → vertex_id
-    vid_to_hexes = {}  # vertex_id → sorted hex_ids
+    pos_to_vid = {}
+    vid_to_hexes = {}
 
     for (hx, hy, hz), hidx in hex_cubes.items():
         for c, (cx, cy, cz) in enumerate(CORNER_OFFSETS):
@@ -81,13 +82,11 @@ def _build_topology(hex_cubes: dict[tuple, int]):
             if hid not in vid_to_hexes[pos_to_vid[pos]]:
                 vid_to_hexes[pos_to_vid[pos]].append(hid)
 
-    # Sort vertex hex lists
     for vid in vid_to_hexes:
         vid_to_hexes[vid] = sorted(vid_to_hexes[vid],
                                    key=lambda x: int(x[1:]))
 
-    # Edges: consecutive corners of each hex
-    edge_set = {}  # (v1, v2) sorted → edge_id
+    edge_set = {}
     for (hx, hy, hz), hidx in hex_cubes.items():
         for c in range(6):
             c2 = (c + 1) % 6
@@ -101,7 +100,6 @@ def _build_topology(hex_cubes: dict[tuple, int]):
             if ek not in edge_set:
                 edge_set[ek] = f"e{len(edge_set)}"
 
-    # Build vertices and edges
     vertices = []
     for pos, vid in sorted(pos_to_vid.items(), key=lambda x: int(x[1][1:])):
         vertices.append(Vertex(id=vid, hexes=vid_to_hexes[vid], pos=pos))
@@ -110,7 +108,6 @@ def _build_topology(hex_cubes: dict[tuple, int]):
     for (v1, v2), eid in sorted(edge_set.items(), key=lambda x: int(x[1][1:])):
         edges.append(Edge(id=eid, v1=v1, v2=v2))
 
-    # Compute adjacency
     edge_map = {}
     for e in edges:
         edge_map.setdefault(e.v1, []).append(e.id)
@@ -135,34 +132,139 @@ def _build_topology(hex_cubes: dict[tuple, int]):
     return vertices, edges
 
 
-def generate_map(seed=42):
-    rng = random.Random(seed)
-
-    resources = list(RESOURCE_POOL); rng.shuffle(resources)
-    numbers = []; [numbers.extend([num]*c) for num, c in DICE_DISTRIBUTION]
-    rng.shuffle(numbers)
-
-    # Build hexes
-    hexes = []; hex_cubes = {}; hidx = num_idx = 0
+def _build_hex_adjacency() -> dict[int, list[int]]:
+    """hex idx -> sorted list of adjacent hex idx (radius-2 board)."""
+    cubes = []
     for r, count in enumerate(HEX_ROWS):
         for c in range(count):
-            res = resources[hidx]
-            num = numbers[num_idx] if res != DESERT else None
-            if res != DESERT: num_idx += 1
+            cubes.append(_board_to_cube(r, c))
+    cube_to_idx = {cube: i for i, cube in enumerate(cubes)}
+    adj = {i: [] for i in range(len(cubes))}
+    for i, cube in enumerate(cubes):
+        for d in CUBE_DIRS:
+            nb = (cube[0]+d[0], cube[1]+d[1], cube[2]+d[2])
+            if nb in cube_to_idx:
+                adj[i].append(cube_to_idx[nb])
+    for i in adj:
+        adj[i].sort()
+    return adj
+
+
+_HEX_ADJACENCY = None
+def _hex_adjacency() -> dict[int, list[int]]:
+    global _HEX_ADJACENCY
+    if _HEX_ADJACENCY is None:
+        _HEX_ADJACENCY = _build_hex_adjacency()
+    return _HEX_ADJACENCY
+
+
+def _assign_anticlustered(items: list, positions: list[int],
+                          conflict, rng: random.Random,
+                          max_retries: int = 200) -> Optional[dict[int, object]]:
+    """Greedy (MRV) placement with retry so adjacent positions never conflict.
+
+    ``positions`` are the target hex indices; ``items`` the values to place
+    (one per position). ``conflict(a, b)`` decides whether two values may not
+    sit on adjacent hexes. Returns ``{position: item}`` or None if no conflict-
+    free assignment was found within ``max_retries`` random restarts.
+    """
+    adj = _hex_adjacency()
+    order = sorted(positions, key=lambda p: -len(adj[p]))  # most constrained first
+    for _ in range(max_retries):
+        remaining = list(items)
+        rng.shuffle(remaining)
+        assignment = {}
+        ok = True
+        for pos in order:
+            # forbidden values: those conflicting with any already-placed neighbor
+            forbidden = set()
+            for nb in adj[pos]:
+                placed = assignment.get(nb)
+                if placed is None:
+                    continue
+                for it in remaining:
+                    if conflict(it, placed):
+                        forbidden.add(it)
+            candidates = [it for it in remaining if it not in forbidden]
+            if not candidates:
+                ok = False
+                break
+            # MRV: prefer the value with fewest remaining copies (use rare first)
+            chosen = min(candidates, key=lambda it: remaining.count(it))
+            assignment[pos] = chosen
+            remaining.remove(chosen)
+        if ok and len(assignment) == len(positions):
+            return assignment
+    return None
+
+
+def generate_map(seed=42, total_rounds=TOTAL_ROUNDS, map_seed=None):
+    """Generate a balanced map. ``map_seed`` (optional) independently controls
+    the resource/number layout; ``seed`` controls the dice sequence (and is the
+    fallback map seed when ``map_seed`` is None, keeping old behavior intact).
+
+    Balance (b-mode) is always applied:
+      * resource anti-clustering — same resource never on adjacent hexes;
+      * number balancing — red numbers (6, 8) never adjacent.
+    """
+    map_rng = random.Random(seed if map_seed is None else map_seed)
+    dice_rng = random.Random(seed)
+
+    adj = _hex_adjacency()
+    positions = list(adj.keys())  # 0..18
+
+    # 1) resources: anti-cluster same resources
+    res_ass = _assign_anticlustered(list(RESOURCE_POOL), positions,
+                                    lambda a, b: a == b, map_rng)
+    if res_ass is None:
+        # fallback: plain shuffle (should be vanishingly rare)
+        res = list(RESOURCE_POOL)
+        map_rng.shuffle(res)
+        res_ass = {p: res[i] for i, p in enumerate(positions)}
+
+    # 2) numbers: red numbers (6,8) never adjacent
+    numbers = []
+    for num, cnt in DICE_DISTRIBUTION:
+        numbers.extend([num]*cnt)
+    non_desert = [p for p in positions if res_ass[p] != DESERT]
+    num_ass = _assign_anticlustered(numbers, non_desert,
+                                    lambda a, b: a in RED_NUMBERS and b in RED_NUMBERS,
+                                    map_rng)
+    if num_ass is None:
+        nums = list(numbers)
+        map_rng.shuffle(nums)
+        num_ass = {p: nums[i] for i, p in enumerate(non_desert)}
+
+    # Build hexes in row-major order
+    hexes = []
+    hex_cubes = {}
+    hidx = 0
+    for r, count in enumerate(HEX_ROWS):
+        for c in range(count):
             cube = _board_to_cube(r, c)
+            res = res_ass[hidx]
+            num = num_ass.get(hidx) if res != DESERT else None
             hexes.append(HexTile(id=f"h{hidx}", row=r, col=c, resource=res,
                                  number=num, cube=cube))
             hex_cubes[cube] = hidx
             hidx += 1
 
-    # Build topology
     vertices, edges = _build_topology(hex_cubes)
 
-    dice_seq = [rng.randint(1, 6) + rng.randint(1, 6)
-                for _ in range(TOTAL_ROUNDS)]
+    dice_seq = [dice_rng.randint(1, 6) + dice_rng.randint(1, 6)
+                for _ in range(total_rounds * 2)]
 
     return GameMap(hexes=hexes, vertices=vertices, edges=edges, seed=seed,
                    dice_sequence=dice_seq)
+
+
+def compact_map_view(game_map: GameMap) -> dict:
+    """Serialize the static map topology to its compact dictionary form."""
+    return {
+        "hexes": {h.id: [h.resource, h.number] for h in game_map.hexes},
+        "vertices": {v.id: list(v.hexes) for v in game_map.vertices},
+        "edges": {e.id: [e.v1, e.v2] for e in game_map.edges},
+    }
 
 
 if __name__ == "__main__":
@@ -178,3 +280,24 @@ if __name__ == "__main__":
             nb = m.vertex_by_id(av)
             assert v.id in nb.adjacent_vertices
     print("✅ Topology valid")
+
+    # balance checks
+    adj = _hex_adjacency()
+    # same resource adjacent?
+    bad_res = 0
+    for i in adj:
+        for j in adj[i]:
+            if j < i:
+                continue
+            if m.hexes[i].resource == m.hexes[j].resource:
+                bad_res += 1
+    # red numbers adjacent?
+    bad_red = 0
+    for i in adj:
+        for j in adj[i]:
+            if j < i:
+                continue
+            ni, nj = m.hexes[i].number, m.hexes[j].number
+            if ni in RED_NUMBERS and nj in RED_NUMBERS:
+                bad_red += 1
+    print(f"resource-adjacency violations: {bad_res}, red-adjacency violations: {bad_red}")

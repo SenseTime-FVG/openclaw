@@ -13,8 +13,6 @@ const ResourceMap = Type.Object(
   { additionalProperties: false },
 );
 
-export const ViewGameStateSchema = Type.Object({});
-
 export const BuildSchema = Type.Object({
   type: Type.String({ enum: ["road", "settlement", "upgrade"] }),
   edge_id: Type.Optional(Type.String()),
@@ -54,7 +52,6 @@ export const ClaimProjectSchema = Type.Object({
       "tech_pioneer",
       "resource_tycoon",
       "road_king",
-      "hex_lord",
     ],
   }),
 });

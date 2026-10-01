@@ -5,15 +5,16 @@ OpenClaw players. The environment combines a Python game engine with an OpenClaw
 an optional match runner that creates isolated player profiles, starts one Gateway per player, and
 serializes LLM turns.
 
-This plugin is an evaluation and experimentation environment. It does not include an RL training
-pipeline, reward model, dataset, rollout service, or model weights.
+This plugin is an evaluation and experimentation environment. The RL training integration
+(reward model, dataset, rollout) lives in a separate repository (`verl-tradecraft`), not in this
+plugin; this plugin ships no model weights.
 
 ## Architecture
 
 | Layer               | Implementation                                    | Responsibility                                                                                                                          |
 | ------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
 | Match orchestration | `python/game_runner.py`                           | Creates player profiles, starts processes, schedules agents, delivers messages, retries transient failures, and writes match artifacts. |
-| OpenClaw runtime    | One isolated Gateway and agent session per player | Runs the selected model and exposes only the six TradeCraft tools.                                                                      |
+| OpenClaw runtime    | One isolated Gateway and agent session per player | Runs the selected model and exposes only the four TradeCraft tools.                                                                    |
 | Tool plugin         | `index.ts` and `src/tools.ts`                     | Registers tools, validates model-facing parameters with TypeBox, and converts engine responses to `AgentToolResult`.                    |
 | Protocol adapter    | `src/client.ts`                                   | Maintains one registered Unix-domain-socket connection per player and serializes NDJSON requests.                                       |
 | Game engine         | `python/engine.py`                                | Owns the canonical state machine, validates every action, resolves trades, produces resources, and scores the match.                    |
@@ -35,43 +36,77 @@ The runner observes the engine through atomic `state.json` snapshots. Player mes
 by the engine and then injected into recipient OpenClaw sessions by the runner. The socket protocol
 does not send unsolicited responses because it has no request IDs and relies on FIFO ordering.
 
+Each wake injects the player's dynamic state plus the list of state-affecting events (builds,
+trade settlements, project claims, and production rolls) that occurred since its previous turn,
+newest last. The player's own actions and chat messages are excluded. The static map topology
+lives in the player's workspace context rather than being resent each wake.
+
 ## Game model
 
 - Three or four players.
 - A deterministic 19-hex board with 54 vertices and 72 edges.
 - A snake-draft placement phase: `P0 -> ... -> PN -> PN -> ... -> P0`.
-- Ten production rounds with two successful actions per player turn.
+- Twelve production rounds. Each round resolves two `2d6` production rolls; a player who gains
+  nothing from either roll receives one gold. Each player is scheduled twice per round, one action
+  per wake; a player with no productive action ends its reply without a tool call (there is no
+  pass tool).
 - Five standard resources (`wood`, `stone`, `iron`, `crystal`, and `silk`) plus `gold`.
 - Roads, settlements, two upgrade levels, bilateral trades, public projects, and final scoring.
 - Gold can cover missing build resources at a one-for-one rate after explicit gold costs are
   reserved.
 
-The seed controls the map, resource layout, tile numbers, and dice sequence. Reusing a seed makes
-engine behavior reproducible, but LLM decisions can still vary.
+The seed controls the dice sequence (and is the fallback map seed); an optional independent
+`map_seed` controls the resource layout and tile numbers. Map generation always applies balance
+constraints (no adjacent same-resource hexes; the red numbers 6 and 8 are never adjacent). Reusing
+a seed makes engine behavior reproducible, but LLM decisions can still vary.
 
-## Tools
+### Tools
 
-| Tool                         | Turn rule                                                      |   Action cost |
-| ---------------------------- | -------------------------------------------------------------- | ------------: |
-| `tradecraft_view_game_state` | Available at any time, including after game over.              |             0 |
-| `tradecraft_build`           | Placement-gated during setup; current-player-only during play. | 1 during play |
-| `tradecraft_propose_trade`   | Current player only.                                           |             1 |
-| `tradecraft_respond_trade`   | Available to the pending trade parties.                        |             0 |
-| `tradecraft_send_message`    | Current player only; broadcasts to all other players.          |             1 |
-| `tradecraft_claim_project`   | Current player only; project must be unclaimed and eligible.   |             1 |
+| Tool                       | Turn rule                                                     | Action cost |
+| -------------------------- | ------------------------------------------------------------- | ----------: |
+| `tradecraft_build`         | Placement-gated during setup; play-phase otherwise.           |           1 |
+| `tradecraft_propose_trade`  | Play-phase only; one pending trade at a time.                  |           1 |
+| `tradecraft_send_message`  | Play-phase only; broadcasts to all other players.              |           1 |
+| `tradecraft_claim_project` | Play-phase only; project must be unclaimed and eligible.       |           1 |
 
-Every trade response includes a non-empty `message` with decision-relevant feedback:
+These four tools are the only model-facing tools. The engine also implements `view_game_state`,
+but the runner calls it and injects the resulting state into each wake message; players have no
+tool to request it themselves. (An earlier revision exposed a larger tool set — including `pass`
+and `respond_trade` — which no longer exists.)
+
+`tradecraft_send_message` is a normal negotiation action: a player can broadcast concrete
+resource needs, acceptable exchange terms, or a request for future offers. Because it consumes an
+action, vague or repetitive messages should be avoided. To end a turn, a player stops calling
+tools entirely — there is no pass tool; ending the reply without a tool call hands control back
+to the runner.
+
+Trade response is not a tool. When a pending trade names a player as responder, the runner wakes
+it and the responder expresses its decision as a single JSON object in its final message text:
 
 ```json
 {
-  "action": "reject",
-  "message": "I need to keep my stone for an upgrade."
+  "decision": "accept",
+  "reason": "Crystal and iron are surplus to me."
 }
 ```
 
-For a counteroffer, include both `offer` and `request`. The engine records the feedback as part of
-the response, and the runner delivers it to the other party without consuming a normal turn
-action.
+`decision` is `accept` or `reject` (there is no counteroffer). The runner parses this JSON and
+submits it to the engine, which delivers `reason` to the proposer. A missing or malformed decision
+is treated as a rejection with a system-supplied reason.
+
+## Action limits and scheduling
+
+Turn pacing is owned by the match runner, not the engine. The engine exposes a configurable
+`limit` (default 3, `--limit` on the runner / engine) as a reserved knob, and tracks per-player
+action health — `total_actions`, `illegal_actions`, and `forfeits` — which is surfaced in the
+settled state under `legality` for action-legality rewards. The engine does not itself count
+consecutive failures, warn, or forfeit turns.
+
+The one pacing rule the engine enforces is **one action per wake**: once a player commits its
+scheduled action, any further tool call in the same wake is rejected (`acted_this_wake`). A player
+ends a turn by not calling any tool. The runner drives the snake-draft placement order and, during
+play, schedules each player twice per round; it forfeits a player whose agent fails, stalls, or
+returns no reply, so a silent player never blocks the match.
 
 ## Scheduling contract
 
@@ -92,6 +127,30 @@ defines two important yield points:
 
 These rules live in `prompts/player.md` and are repeated in the runner's dynamic wake message.
 
+## Error feedback contract
+
+Every engine action either commits and returns `{"ok": true, "result": …}` or is rejected
+with `{"ok": false, "error": "…"}`. A rejected request never mutates game state, never records a
+game action, and never advances the turn or round. Rejection is how the engine teaches the model
+the rules, so the `error` string must be self-contained and actionable — the player must be able
+to correct the request from the message alone, without re-reading the full state:
+
+1. **What** was rejected — the specific id, resource, or condition (e.g. `Invalid vertex: v99`, `Unknown project: hex_lord`).
+2. **Why** it failed — the rule violated (e.g. distance, affordability, turn order, ownership).
+3. **How to fix it** — the requirement and, when applicable, current value (e.g. `Have: {…}` or the remaining condition).
+
+Canonical examples:
+
+```text
+Cannot afford settlement. Cost: {wood:1, stone:1, iron:1, silk:1}, Have: {wood:1, stone:0, …}
+Too close to P2's building at v41 (min 2 edges between settlements).
+Conditions not met for 'Trade Master': requires complete 8+ trades; you currently have 3 trades completed.
+Not your turn. Current: P1.
+```
+
+Partial-failure defects — a bare `ok: false` with no explanation, or state mutated before a
+validation error is discovered — are treated as correctness bugs, not cosmetic issues.
+
 ## Requirements
 
 - macOS, Linux, or WSL with Unix domain socket support.
@@ -111,7 +170,8 @@ python3 extensions/tradecraft/python/game_runner.py \
   --mode mock
 ```
 
-Mock players complete placement and all ten rounds without calling an LLM. This verifies the map,
+Mock players complete placement and all twelve rounds without calling an LLM. Each round resolves
+two production rolls, and a player who gains nothing from either roll receives one gold. This verifies the map,
 engine protocol, state transitions, scheduling loop, and terminal scoring.
 
 ## Run an OpenClaw match

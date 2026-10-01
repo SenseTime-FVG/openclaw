@@ -35,16 +35,23 @@ class GameRunnerTest(unittest.TestCase):
         return load_settings(config_path)
 
     @staticmethod
-    def _play_state(actions_used=0):
+    def _play_state(advanced=False):
+        players = (
+            [{"buildings": ["v0"], "roads": [], "resources": {"wood": 1}},
+             {"buildings": [], "roads": [], "resources": {}},
+             {"buildings": [], "roads": [], "resources": {}}]
+            if advanced else
+            [{"buildings": [], "roads": [], "resources": {}},
+             {"buildings": [], "roads": [], "resources": {}},
+             {"buildings": [], "roads": [], "resources": {}}]
+        )
         return {
             "phase": "play",
-            "placement_round": 6,
-            "placement_done": False,
             "round": 1,
-            "current_player": 0,
-            "current_actions_used": actions_used,
+            "max_rounds": 12,
             "pending_trade": None,
             "game_over": False,
+            "players": players,
         }
 
     def test_prepare_profiles_isolates_players_without_llm_secrets(self):
@@ -59,6 +66,10 @@ class GameRunnerTest(unittest.TestCase):
                 plugin = config["plugins"]["entries"]["tradecraft"]["config"]
                 self.assertEqual(plugin["playerId"], player.player_id)
                 self.assertEqual(plugin["socketPath"], str(settings.socket_path))
+                self.assertNotIn(
+                    "tradecraft_pass",
+                    config["agents"]["list"][0]["tools"]["allow"],
+                )
                 self.assertEqual(config["gateway"]["auth"], {
                     "mode": "token",
                     "token": player.gateway_token,
@@ -74,16 +85,31 @@ class GameRunnerTest(unittest.TestCase):
                     instructions,
                 )
                 self.assertIn("Respond exactly once and stop", instructions)
-                self.assertIn("opinion in the required `message` field", instructions)
+                self.assertIn("single JSON decision", instructions)
+                self.assertIn("The injected events", instructions)
+                self.assertIn("`tradecraft_send_message` is a normal negotiation action", instructions)
+                self.assertIn("end your reply without calling any tool", instructions)
+                tools = (player.workspace / "TOOLS.md").read_text(encoding="utf-8")
+                self.assertIn("four `tradecraft_*` tools", tools)
 
     def test_seed_override_wins_over_configured_seed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             settings = self._settings(root)
-            overridden = load_settings(root / "runner.json", seed_override=97)
+            profile_root = root / "isolated-profile"
+            overridden = load_settings(
+                root / "runner.json",
+                seed_override=97,
+                base_port_override=30789,
+                profile_root_override=profile_root,
+                max_rounds_override=20,
+            )
 
             self.assertEqual(settings.seed, 11)
             self.assertEqual(overridden.seed, 97)
+            self.assertEqual(overridden.base_port, 30789)
+            self.assertEqual(overridden.profile_root, profile_root.resolve())
+            self.assertEqual(overridden.max_rounds, 20)
 
     def test_prepare_profiles_assigns_and_isolates_per_player_api_keys(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -123,19 +149,14 @@ class GameRunnerTest(unittest.TestCase):
             self.assertNotIn(key_envs[1], player_env)
             self.assertNotIn(key_envs[2], player_env)
 
-    def test_progress_key_tracks_current_player_actions(self):
-        state = {
-            "phase": "play",
-            "placement_round": 6,
-            "placement_done": False,
-            "round": 1,
-            "current_player": 1,
-            "current_actions_used": 0,
-            "pending_trade": None,
-            "game_over": False,
-        }
+    def test_progress_key_tracks_board_changes(self):
+        state = self._play_state()
         before = _progress_key(state)
-        state["current_actions_used"] = 1
+        state["players"] = [
+            {"buildings": ["v0"], "roads": [], "resources": {"wood": 1}},
+            {"buildings": [], "roads": [], "resources": {}},
+            {"buildings": [], "roads": [], "resources": {}},
+        ]
         self.assertNotEqual(before, _progress_key(state))
 
     def test_agent_failure_classification_separates_retryable_and_fatal_errors(self):
@@ -181,7 +202,7 @@ class GameRunnerTest(unittest.TestCase):
             )
 
             with (
-                patch.object(runner, "_find_node", return_value="node"),
+                patch.object(runner, "_openclaw_command", side_effect=lambda *args: ["node", *args]),
                 patch.object(runner, "_read_state", return_value=self._play_state()),
                 patch("game_runner.subprocess.run", side_effect=[failed, succeeded]) as run,
                 patch("game_runner.random.uniform", return_value=3.0),
@@ -193,9 +214,12 @@ class GameRunnerTest(unittest.TestCase):
             self.assertEqual(run.call_count, 2)
             sleep.assert_called_once_with(3.0)
             command = run.call_args_list[0].args[0]
-            wake_message = command[command.index("--message") + 1]
-            self.assertIn("respond exactly once with a concise message", wake_message)
-            self.assertIn("successful trade proposal, stop immediately", wake_message)
+            wake_message = (settings.match_dir / "wake-p0.txt").read_text(encoding="utf-8")
+            self.assertIn("Read the game state and any step instruction", wake_message)
+            self.assertIn("a successful trade proposal", wake_message)
+            self.assertIn("stop immediately", wake_message)
+            self.assertIn("tradecraft_send_message is available for concrete negotiation", wake_message)
+            self.assertIn("do not call any tool — simply end your reply to end the turn", wake_message)
             records = [
                 json.loads(line)
                 for line in (settings.match_dir / "agent-p0.jsonl")
@@ -238,7 +262,7 @@ class GameRunnerTest(unittest.TestCase):
             )
 
             with (
-                patch.object(runner, "_find_node", return_value="node"),
+                patch.object(runner, "_openclaw_command", side_effect=lambda *args: ["node", *args]),
                 patch.object(runner, "_read_state", return_value=self._play_state()),
                 patch("game_runner.subprocess.run", side_effect=[failed, succeeded]) as run,
                 patch("game_runner.time.monotonic", return_value=100.0),
@@ -277,7 +301,7 @@ class GameRunnerTest(unittest.TestCase):
             )
 
             with (
-                patch.object(runner, "_find_node", return_value="node"),
+                patch.object(runner, "_openclaw_command", side_effect=lambda *args: ["node", *args]),
                 patch.object(runner, "_read_state", return_value=self._play_state()),
                 patch("game_runner.subprocess.run", return_value=failed) as run,
                 patch("game_runner.time.monotonic", side_effect=[100.0, 161.0]),
@@ -307,7 +331,7 @@ class GameRunnerTest(unittest.TestCase):
             )
 
             with (
-                patch.object(runner, "_find_node", return_value="node"),
+                patch.object(runner, "_openclaw_command", side_effect=lambda *args: ["node", *args]),
                 patch.object(runner, "_read_state", return_value=self._play_state()),
                 patch("game_runner.subprocess.run", return_value=failed) as run,
                 patch("game_runner.time.sleep") as sleep,
@@ -331,10 +355,10 @@ class GameRunnerTest(unittest.TestCase):
             runner = GameRunner(settings)
             settings.match_dir.mkdir(parents=True)
             baseline = self._play_state()
-            advanced = self._play_state(actions_used=1)
+            advanced = self._play_state(advanced=True)
 
             with (
-                patch.object(runner, "_find_node", return_value="node"),
+                patch.object(runner, "_openclaw_command", side_effect=lambda *args: ["node", *args]),
                 patch.object(
                     runner,
                     "_read_state",
@@ -436,7 +460,9 @@ class GameRunnerTest(unittest.TestCase):
             final_state = GameRunner(settings).run()
 
             self.assertTrue(final_state["game_over"])
-            self.assertEqual(final_state["round"], 11)
+            self.assertEqual(final_state["round"], 12)
+            self.assertEqual(final_state["max_rounds"], 12)
+            self.assertEqual(len(final_state["dice_rolls"]), 2)
             self.assertEqual(len(final_state["scores"]), 3)
             self.assertTrue(settings.engine_event_path.exists())
             self.assertTrue(settings.runner_event_path.exists())

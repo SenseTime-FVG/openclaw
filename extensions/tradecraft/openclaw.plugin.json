@@ -8,10 +8,8 @@
   },
   "contracts": {
     "tools": [
-      "tradecraft_view_game_state",
       "tradecraft_build",
       "tradecraft_propose_trade",
-      "tradecraft_respond_trade",
       "tradecraft_send_message",
       "tradecraft_claim_project"
     ]
