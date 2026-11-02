@@ -23,7 +23,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from map_generator import ACTIONS_PER_ROUND
+from map_generator import ACTIONS_PER_ROUND, WAKE_CHAT_LIMIT, WAKE_TRADE_LIMIT
+from i18n import make_translator
 
 
 TRADECRAFT_TOOLS = [
@@ -65,12 +66,29 @@ RETRYABLE_AGENT_FAILURES = {
 
 @dataclass(frozen=True)
 class PlayerRuntime:
+    """One in-game player, backed by a dedicated agent on the shared gateway."""
+
     player_id: int
+    workspace: Path
+    agent_id: str
+    session_key: str
+
+
+@dataclass(frozen=True)
+class GatewayRuntime:
+    """The single OpenClaw gateway that serves every player agent.
+
+    One gateway process (one state dir / config path / port / token) hosts all
+    per-player agents, so the sandbox only ever schedules one OpenClaw gateway
+    regardless of the player count. This removes the process-scheduling
+    starvation seen when N gateways shared a small-vCPU sandbox.
+    """
+
     port: int
     gateway_token: str
+    root: Path
     state_dir: Path
     config_path: Path
-    workspace: Path
 
 
 @dataclass(frozen=True)
@@ -100,17 +118,38 @@ class RunnerSettings:
     gateway_startup_seconds: int
     max_agent_calls_without_progress: int
     max_agent_calls: int
+    # Per-wake budget on illegal/over-action calls (design §7.4.1). A wake whose
+    # illegal_actions delta exceeds this keeps its provisional forfeit.
+    max_illegal_per_wake: int
     base_port: int
     port_step: int
     config_overlay: dict
     role_sandbox_urls: dict
+    player_models: dict
     teams: Optional[list[list[int]]]
     map_seed: Optional[int]
+    agents_schema: str = "entries"
+    language: str = "en"
 
     def api_key_env_for_player(self, player_id: int) -> str:
         if self.api_key_envs:
             return self.api_key_envs[player_id]
         return self.api_key_env
+
+    def model_for_player(self, player_id: int) -> str:
+        """Model id for a player: per-player override or the shared default.
+
+        ``openclaw.playerModels`` maps a player index to a ``provider/model``
+        id (e.g. ``bailian/qwen3.8-27b``) so external models can take some
+        seats in a frozen-opponent match; unlisted players use ``model`` (the
+        in-training policy).
+        """
+        return self.player_models.get(player_id, self.model)
+
+    @property
+    def t(self):
+        """Keyed translator bound to this match's language."""
+        return make_translator(self.language)
 
     @property
     def match_dir(self) -> Path:
@@ -133,9 +172,6 @@ class RunnerSettings:
         digest = hashlib.sha256(str(self.match_dir).encode("utf-8")).hexdigest()[:12]
         return Path(tempfile.gettempdir()) / f"tradecraft-{digest}.sock"
 
-    @property
-    def session_key(self) -> str:
-        return f"agent:{self.agent_id}:tradecraft-{self.game_id}"
 
 
 class ManagedProcess:
@@ -216,6 +252,20 @@ class ControllerClient(JsonLineClient):
             raise RuntimeError(f"start_round failed: {response}")
         return response["result"]
 
+    def roll_for_player(self, player_id: int) -> dict:
+        """One production roll for ``player_id``, settled for the whole table."""
+        response = self.request("roll_for_player", {"player_id": player_id})
+        if not response.get("ok"):
+            raise RuntimeError(f"roll_for_player({player_id}) failed: {response}")
+        return response["result"]
+
+    def move_robber(self, player_id: int, hex_id: str) -> dict:
+        """Apply the robber move the scheduler parsed out of the owner's prose."""
+        response = self.request("move_robber", {"player_id": player_id, "hex_id": hex_id})
+        if not response.get("ok"):
+            raise RuntimeError(f"move_robber({player_id}, {hex_id}) failed: {response}")
+        return response["result"]
+
     def end_placement(self) -> dict:
         response = self.request("end_placement", {})
         if not response.get("ok"):
@@ -234,13 +284,6 @@ class ControllerClient(JsonLineClient):
             raise RuntimeError(f"end_game failed: {response}")
         return response["result"]
 
-    def resolve_trade(self, decision: str, reason: str) -> dict:
-        # An ``ok: False`` here is a normal in-game rejection (e.g. the
-        # proposer no longer holds the offered resources at execution time),
-        # not an engine fault. Return the raw response so the scheduler can
-        # treat it as a forfeit instead of crashing the whole match.
-        return self.request("resolve_trade", {"decision": decision, "reason": reason})
-
 
 def _map_topology_json(settings: RunnerSettings) -> str:
     """Render the fixed hex map (hexes/vertices/edges) as compact JSON.
@@ -250,7 +293,8 @@ def _map_topology_json(settings: RunnerSettings) -> str:
     """
     from map_generator import generate_map, compact_map_view
     game_map = generate_map(settings.seed, total_rounds=settings.max_rounds,
-                            map_seed=settings.map_seed)
+                            map_seed=settings.map_seed,
+                            num_players=settings.players)
     return json.dumps(compact_map_view(game_map), separators=(",", ":"))
 
 
@@ -278,6 +322,22 @@ def _write_json(path: Path, payload: dict):
     os.replace(temporary, path)
 
 
+def _write_json_compact(path: Path, payload: dict):
+    """Like ``_write_json`` but single-line.
+
+    The harness reads side-channel artifacts (thinking.json / health.json) on
+    the crash/timeout path with ``cat <glob> | head -1``, which only survives
+    single-object, single-line JSON. Write these compact (matching state.json)
+    so that read yields the whole object.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
 def _compression_url(base_url: str) -> str:
     """Derive a gateway's context-compression endpoint from its chat base URL."""
     if base_url.endswith("/v1"):
@@ -296,6 +356,21 @@ def _output_text(value) -> str:
     return value or ""
 
 
+def _is_transient_gateway_error(detail: str) -> bool:
+    """True for gateway RPC failures that a short retry can clear.
+
+    The WebSocket endpoint can be briefly unready just after the TCP port
+    opens (or during a restart), which surfaces as a handshake timeout / closed
+    connection rather than a business error.
+    """
+    text = (detail or "").lower()
+    return any(marker in text for marker in (
+        "timed out", "timeout", "not reachable", "handshake",
+        "etimedout", "econnrefused", "econnreset", "connection closed",
+        "closed before", "socket hang up", "transport",
+    ))
+
+
 def _agent_failure_detail(record: dict) -> str:
     return (
         str(record.get("error", "")).strip()
@@ -305,10 +380,36 @@ def _agent_failure_detail(record: dict) -> str:
     )
 
 
+def _agent_envelope_failed(stdout: str) -> bool:
+    """True only when the CLI envelope explicitly reports a failed run.
+
+    A clean exit (``returncode == 0``) with a normal reply is a successful
+    wake. Without this check every successful wake fell through to failure
+    classification, and because the envelope carries fields such as
+    ``"summaryChars": 502``, the numeric 5xx matcher then reported a phantom
+    ``server_error`` and re-ran the whole agent call.
+    """
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    status = str(data.get("status", "")).strip().lower()
+    if status and status not in ("ok", "completed", "success"):
+        return True
+    return bool(str(data.get("error", "")).strip())
+
+
 def _classify_agent_failure(record: dict) -> AgentFailureKind:
     """Classify runner-visible failures after OpenClaw's own provider handling."""
     text = "\n".join(
         str(record.get(key, "")) for key in ("error", "stderr", "stdout")
+    ).lower()
+    # Numeric HTTP codes are only meaningful in the error channels: the reply
+    # envelope legitimately contains numbers such as ``summaryChars: 502``.
+    error_text = "\n".join(
+        str(record.get(key, "")) for key in ("error", "stderr")
     ).lower()
 
     # Permanent failures take precedence over broad strings such as "rate limit"
@@ -346,7 +447,7 @@ def _classify_agent_failure(record: dict) -> AgentFailureKind:
         "overloaded", "over capacity", "server busy", "temporarily busy",
     )):
         return AgentFailureKind.OVERLOADED
-    if re.search(r"(?<!\d)(?:500|502|503|504)(?!\d)", text) or any(
+    if re.search(r"(?<!\d)(?:500|502|503|504)(?!\d)", error_text) or any(
         marker in text for marker in (
             "internal server error", "bad gateway", "service unavailable",
             "gateway timeout",
@@ -409,6 +510,7 @@ def load_settings(config_path: Path, mode_override: Optional[str] = None,
         if not isinstance(raw_map_seed, int) or isinstance(raw_map_seed, bool):
             raise ValueError("map_seed must be an integer")
         map_seed = int(raw_map_seed)
+    language = str(config.get("language", "en")).strip() or "en"
     openclaw = config.get("openclaw", {})
     runtime_root = _resolve_path(
         config.get("runtimeRoot", str(repo_root / "runs" / "tradecraft")),
@@ -427,6 +529,13 @@ def load_settings(config_path: Path, mode_override: Optional[str] = None,
         raise ValueError("gameId must contain only letters, numbers, dot, underscore, or dash")
 
     openclaw_bin = str(openclaw.get("bin", "")).strip()
+    # Target runtime is OpenClaw 2026.9.9, whose agent roster is the keyed
+    # ``agents.entries`` map. ``list``/``auto`` remain available for older CLIs.
+    agents_schema = str(openclaw.get("agentsSchema", "entries")).strip().lower()
+    if agents_schema not in ("auto", "list", "entries"):
+        raise ValueError(
+            "openclaw.agentsSchema must be 'auto', 'list', or 'entries'"
+        )
     api_key_env = str(openclaw.get("apiKeyEnv", "")).strip()
     if api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
         raise ValueError("openclaw.apiKeyEnv must be a valid environment variable name")
@@ -445,6 +554,31 @@ def load_settings(config_path: Path, mode_override: Optional[str] = None,
         )
     if len(set(api_key_envs)) != len(api_key_envs):
         raise ValueError("openclaw.apiKeyEnvs entries must be unique")
+    raw_player_models = openclaw.get("playerModels", {})
+    if not isinstance(raw_player_models, dict):
+        raise ValueError(
+            "openclaw.playerModels must be an object mapping player id -> model"
+        )
+    player_models: dict[int, str] = {}
+    for raw_player_id, raw_model in raw_player_models.items():
+        try:
+            player_id = int(raw_player_id)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "openclaw.playerModels keys must be player ids "
+                f"(0..{players - 1}), got {raw_player_id!r}"
+            )
+        if not 0 <= player_id < players:
+            raise ValueError(
+                f"openclaw.playerModels player id {player_id} out of range [0, {players})"
+            )
+        model_value = str(raw_model).strip()
+        if "/" not in model_value:
+            raise ValueError(
+                f"openclaw.playerModels[{player_id}] must use provider/model "
+                f"format, got {raw_model!r}"
+            )
+        player_models[player_id] = model_value
     base_port = int(
         openclaw.get("basePort", 18789)
         if base_port_override is None
@@ -501,39 +635,56 @@ def load_settings(config_path: Path, mode_override: Optional[str] = None,
         gateway_startup_seconds=int(openclaw.get("gatewayStartupSeconds", 90)),
         max_agent_calls_without_progress=int(config.get("maxAgentCallsWithoutProgress", 3)),
         max_agent_calls=int(config.get("maxAgentCalls", 200)),
+        max_illegal_per_wake=int(config.get("maxIllegalActionsPerWake", 3)),
         base_port=base_port,
         port_step=port_step,
         config_overlay=dict(openclaw.get("configOverlay", {})),
         role_sandbox_urls=dict(openclaw.get("roleSandboxUrls", {})),
+        player_models=player_models,
         teams=teams,
         map_seed=map_seed,
+        agents_schema=agents_schema,
+        language=language,
     )
 
 
 def build_player_runtimes(settings: RunnerSettings) -> list[PlayerRuntime]:
+    """One agent per player, all hosted on the single shared gateway."""
     players = []
     for player_id in range(settings.players):
         root = settings.profile_root / f"player-{player_id}"
         players.append(PlayerRuntime(
             player_id=player_id,
-            port=settings.base_port + player_id * settings.port_step,
-            gateway_token=secrets.token_urlsafe(32),
-            state_dir=root / "state",
-            config_path=root / "openclaw.json",
             workspace=root / "workspace",
+            agent_id=f"P{player_id}",
+            session_key=f"agent:P{player_id}:tradecraft-{settings.game_id}",
         ))
     return players
 
 
+def build_gateway_runtime(settings: RunnerSettings) -> GatewayRuntime:
+    """The single gateway process shared by every player agent."""
+    root = settings.profile_root / "gateway"
+    return GatewayRuntime(
+        port=settings.base_port,
+        gateway_token=secrets.token_urlsafe(32),
+        root=root,
+        state_dir=root / "state",
+        config_path=root / "openclaw.json",
+    )
+
+
 def prepare_profiles(settings: RunnerSettings) -> list[PlayerRuntime]:
-    template_path = settings.extension_root / "prompts" / "player.md"
+    template_path = settings.extension_root / "prompts" / f"player.{settings.language}.md"
+    if not template_path.exists():
+        template_path = settings.extension_root / "prompts" / "player.md"
     template = template_path.read_text(encoding="utf-8")
     players = build_player_runtimes(settings)
+    gateway = build_gateway_runtime(settings)
     map_topology = _map_topology_json(settings)
 
     for player in players:
         player.workspace.mkdir(parents=True, exist_ok=True)
-        player.state_dir.mkdir(parents=True, exist_ok=True)
         team_section = ""
         if settings.teams:
             team = next(
@@ -559,7 +710,7 @@ def prepare_profiles(settings: RunnerSettings) -> list[PlayerRuntime]:
         )
         agents_md = (
             instructions
-            + "\n\n## Map topology (fixed for this match; immutable)\n"
+            + "\n\n## " + settings.t("map_topology_header") + "\n"
             + "The hex map is fixed. `hexes` maps hex id to [resource, diceNumber]; "
               "`vertices` maps vertex id to adjacent hex ids; `edges` maps edge id to "
               "[vertexA, vertexB]. Desert hexes have `null` dice number and never produce.\n\n"
@@ -567,8 +718,7 @@ def prepare_profiles(settings: RunnerSettings) -> list[PlayerRuntime]:
         )
         (player.workspace / "AGENTS.md").write_text(agents_md, encoding="utf-8")
         (player.workspace / "SOUL.md").write_text(
-            f"# Persona\n\nYou are TradeCraft player P{player.player_id}. "
-            "Be strategic, concise, and decisive.\n",
+            f"# Persona\n\n{settings.t('player_identity', pid=player.player_id)}\n",
             encoding="utf-8",
         )
         (player.workspace / "IDENTITY.md").write_text(
@@ -576,106 +726,226 @@ def prepare_profiles(settings: RunnerSettings) -> list[PlayerRuntime]:
             encoding="utf-8",
         )
         (player.workspace / "USER.md").write_text(
-            "# Operator\n\nThe match runner is the operator. Follow its turn prompts.\n",
+            f"# Operator\n\n{settings.t('operator_note')}\n",
             encoding="utf-8",
         )
         (player.workspace / "TOOLS.md").write_text(
-            "# Tools\n\nUse only the four `tradecraft_*` tools exposed by the game plugin. "
-            "To end a turn, do not call any tool — simply end your reply.\n",
+            f"# Tools\n\n{settings.t('tools_instruction')}\n",
             encoding="utf-8",
         )
         (player.workspace / "HEARTBEAT.md").write_text("", encoding="utf-8")
 
-        defaults = {
-            "workspace": str(player.workspace),
-            "timeoutSeconds": settings.agent_timeout_seconds,
-            "thinkingDefault": settings.thinking,
-            "skipBootstrap": True,
-        }
-        if settings.model:
-            defaults["model"] = {"primary": settings.model}
-            defaults["models"] = {settings.model: {}}
+    schema = _detect_agents_schema(settings)
+    config = _build_gateway_config(settings, players, gateway, schema)
+    gateway.state_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(gateway.config_path, config)
+    os.chmod(gateway.config_path, 0o600)
+    return players
 
-        config = {
-            "gateway": {
-                "mode": "local",
-                "port": player.port,
-                "bind": "loopback",
-                "auth": {"mode": "token", "token": player.gateway_token},
+
+def _set_agent_roster(config: dict, players: list[PlayerRuntime], schema: str) -> None:
+    """Populate the agent roster using the schema the installed CLI expects.
+
+    OpenClaw <= 2026.7 used ``agents.list``; >= 2026.9 uses the keyed
+    ``agents.entries`` map (with an explicit ``agents.ownership`` marker).
+    """
+    roster = [
+        {
+            "id": player.agent_id,
+            "name": f"TradeCraft P{player.player_id}",
+            "workspace": str(player.workspace),
+            "tools": {"allow": TRADECRAFT_TOOLS},
+        }
+        for player in players
+    ]
+    agents = config.setdefault("agents", {})
+    if schema == "entries":
+        agents["ownership"] = "explicit"
+        agents["entries"] = {
+            entry["id"]: {
+                "name": entry["name"],
+                "workspace": entry["workspace"],
+                "tools": entry["tools"],
+            }
+            for entry in roster
+        }
+    else:
+        agents["list"] = roster
+
+
+def _set_agent_model(config: dict, schema: str, agent_id: str, model_ref: str) -> None:
+    """Point one agent at a specific model ref, honouring the roster schema."""
+    agents = config.get("agents", {})
+    if schema == "entries":
+        entry = agents.get("entries", {}).get(agent_id)
+        if isinstance(entry, dict):
+            entry["model"] = {"primary": model_ref}
+        return
+    for entry in agents.get("list", []):
+        if entry.get("id") == agent_id:
+            entry["model"] = {"primary": model_ref}
+            return
+
+
+def _build_gateway_config(
+    settings: RunnerSettings,
+    players: list[PlayerRuntime],
+    gateway: GatewayRuntime,
+    schema: str,
+) -> dict:
+    """Assemble the single gateway's OpenClaw config (roster + plugin + models)."""
+    config = {
+        "gateway": {
+            "mode": "local",
+            "port": gateway.port,
+            "bind": "loopback",
+            "auth": {"mode": "token", "token": gateway.gateway_token},
+        },
+        "agents": {
+            "defaults": {
+                "timeoutSeconds": settings.agent_timeout_seconds,
+                "thinkingDefault": settings.thinking,
+                "skipBootstrap": True,
             },
-            "agents": {
-                "defaults": defaults,
-                "list": [{
-                    "id": settings.agent_id,
-                    "name": f"TradeCraft P{player.player_id}",
-                    "workspace": str(player.workspace),
-                    "tools": {"allow": TRADECRAFT_TOOLS},
-                }],
-            },
-            "plugins": {
-                "enabled": True,
-                "allow": ["tradecraft"],
-                "entries": {
-                    "tradecraft": {
-                        "enabled": True,
-                        "config": {
-                            "socketPath": str(settings.socket_path),
-                            "playerId": player.player_id,
-                        },
+        },
+        "plugins": {
+            "enabled": True,
+            "allow": ["tradecraft"],
+            "entries": {
+                "tradecraft": {
+                    "enabled": True,
+                    "config": {
+                        "socketPath": str(settings.socket_path),
+                        "playerIds": [player.player_id for player in players],
+                        "language": settings.language,
                     },
                 },
             },
-        }
-        config = _deep_merge(config, settings.config_overlay)
-        config["gateway"]["auth"] = {
-            "mode": "token",
-            "token": player.gateway_token,
-        }
-        player_api_key_env = settings.api_key_env_for_player(player.player_id)
-        if settings.api_key_envs and player_api_key_env:
-            provider_id = settings.model.split("/", 1)[0]
-            provider = (
-                config.get("models", {})
-                .get("providers", {})
-                .get(provider_id)
-            )
-            if not isinstance(provider, dict):
+        },
+    }
+    _set_agent_roster(config, players, schema)
+    config = _deep_merge(config, settings.config_overlay)
+    # Deep-copy before per-agent mutation: ``_deep_merge`` keeps references into
+    # the shared ``config_overlay`` sub-dicts, so mutating in place would leak
+    # one agent's model/apiKey into every other agent's config.
+    config = copy.deepcopy(config)
+    _configure_agent_models(config, settings, players, schema)
+    config["gateway"]["auth"] = {"mode": "token", "token": gateway.gateway_token}
+    return config
+
+
+def _configure_agent_models(
+    config: dict,
+    settings: RunnerSettings,
+    players: list[PlayerRuntime],
+    schema: str,
+) -> None:
+    """Apply the shared default model plus any per-seat model/provider overrides.
+
+    All seats share one gateway config, so per-seat divergence (a frozen
+    opponent model, a per-role sandbox URL, or a per-seat API key) is expressed
+    as a per-seat provider clone plus a per-agent ``model`` primary.
+    """
+    providers = config.setdefault("models", {}).setdefault("providers", {})
+    agents_defaults = config.setdefault("agents", {}).setdefault("defaults", {})
+    # Explicit primary model — newer CLIs reject an implicit/dynamic default.
+    # The overlay may already have set ``agents.defaults.model`` as a bare
+    # string (e.g. "verl/model"); normalize either form to ``{primary: ...}``.
+    existing_model = agents_defaults.get("model")
+    if isinstance(existing_model, dict):
+        existing_model.setdefault("primary", settings.model)
+    else:
+        agents_defaults["model"] = {"primary": settings.model}
+    agents_defaults.setdefault("models", {}).setdefault(settings.model, {})
+
+    for player in players:
+        player_model = settings.model_for_player(player.player_id)
+        api_env = (
+            settings.api_key_env_for_player(player.player_id)
+            if settings.api_key_envs
+            else ""
+        )
+        role_url = None
+        if settings.role_sandbox_urls and player_model == settings.model:
+            role_url = settings.role_sandbox_urls.get(f"P{player.player_id}")
+        needs_provider = bool(role_url) or bool(settings.api_key_envs and api_env)
+
+        agent_model = player_model
+        if needs_provider:
+            provider_id, model_id = player_model.split("/", 1)
+            base_provider = providers.get(provider_id)
+            if not isinstance(base_provider, dict):
                 raise ValueError(
-                    "openclaw.apiKeyEnvs requires a matching custom provider at "
+                    "per-seat provider override requires a matching provider at "
                     f"openclaw.configOverlay.models.providers.{provider_id}"
                 )
-            provider["apiKey"] = f"${{{player_api_key_env}}}"
-        if settings.role_sandbox_urls:
-            role_url = settings.role_sandbox_urls.get(f"P{player.player_id}")
+            clone = copy.deepcopy(base_provider)
             if role_url:
-                # ``config["models"]`` is a shared reference into config_overlay;
-                # deep-copy before mutating so each player's baseUrl stays isolated.
-                config = copy.deepcopy(config)
-                provider_id = settings.model.split("/", 1)[0]
-                provider = (
-                    config.get("models", {})
-                    .get("providers", {})
-                    .get(provider_id)
-                )
-                if not isinstance(provider, dict):
-                    raise ValueError(
-                        "openclaw.roleSandboxUrls requires a matching custom provider at "
-                        f"openclaw.configOverlay.models.providers.{provider_id}"
-                    )
-                provider["baseUrl"] = role_url
-                # Context compaction is session-scoped too: each in-game gateway
-                # must summarise against its own /compression endpoint, otherwise
-                # it lands on the leader session's prefix cache and stalls.
-                compression = (
-                    config.get("models", {})
-                    .get("providers", {})
-                    .get("context-compression")
-                )
-                if isinstance(compression, dict):
-                    compression["baseUrl"] = _compression_url(role_url)
-        _write_json(player.config_path, config)
-        os.chmod(player.config_path, 0o600)
-    return players
+                clone["baseUrl"] = role_url
+            if settings.api_key_envs and api_env:
+                clone["apiKey"] = f"${{{api_env}}}"
+            scoped_provider_id = f"{provider_id}-p{player.player_id}"
+            providers[scoped_provider_id] = clone
+            agent_model = f"{scoped_provider_id}/{model_id}"
+
+        if agent_model != settings.model:
+            _set_agent_model(config, schema, player.agent_id, agent_model)
+            agents_defaults.setdefault("models", {}).setdefault(agent_model, {})
+
+    # Per-role compression endpoints (route 2). NOTE: compaction is configured
+    # once under ``agents.defaults`` and cannot vary per agent, so per-seat
+    # ``/compression`` routing cannot be expressed in single-gateway mode; the
+    # shared ``context-compression`` provider from the overlay is used for all
+    # seats. Only the per-seat provider clones are created here for completeness.
+    base_compression = providers.get("context-compression")
+    if isinstance(base_compression, dict) and settings.role_sandbox_urls:
+        for player in players:
+            role_url = settings.role_sandbox_urls.get(f"P{player.player_id}")
+            if not role_url:
+                continue
+            clone = copy.deepcopy(base_compression)
+            clone["baseUrl"] = _compression_url(role_url)
+            providers[f"context-compression-p{player.player_id}"] = clone
+
+
+def _openclaw_launch_prefix(settings: RunnerSettings) -> list[str]:
+    """Resolve the OpenClaw CLI launch prefix for module-level probing."""
+    binary = settings.openclaw_bin or shutil.which("openclaw") or ""
+    if binary:
+        return [binary]
+    node = shutil.which("node")
+    if not node:
+        return []
+    return [node, str(settings.repo_root / "openclaw.mjs")]
+
+
+def _detect_agents_schema(settings: RunnerSettings) -> str:
+    """Pick ``agents.entries`` vs ``agents.list`` for the installed CLI.
+
+    Defaults to the keyed ``agents.entries`` roster (OpenClaw 2026.9.9 target).
+    ``auto`` probes ``openclaw --version`` and uses the keyed roster for 2026.9+,
+    falling back to the legacy list form; ``list`` forces the legacy shape.
+    """
+    if settings.agents_schema in ("list", "entries"):
+        return settings.agents_schema
+    prefix = _openclaw_launch_prefix(settings)
+    if prefix:
+        try:
+            proc = subprocess.run(
+                [*prefix, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            match = re.search(
+                r"OpenClaw\s+(\d{4})\.(\d+)", f"{proc.stdout}\n{proc.stderr}"
+            )
+            if match:
+                major, minor = int(match.group(1)), int(match.group(2))
+                return "entries" if (major, minor) >= (2026, 9) else "list"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return "list"
 
 
 def _gameplay_progress_key(state: dict) -> tuple:
@@ -687,15 +957,6 @@ def _gameplay_progress_key(state: dict) -> tuple:
     invocation nonetheless advanced the board (e.g. a last tool call landed in
     the Gateway after the CLI returned a nonzero exit).
     """
-    trade = state.get("pending_trade")
-    trade_key = None
-    if trade:
-        trade_key = (
-            trade.get("proposer"),
-            trade.get("responder"),
-            json.dumps(trade.get("offer", {}), sort_keys=True),
-            json.dumps(trade.get("request", {}), sort_keys=True),
-        )
     players_key = tuple(
         (len(p.get("buildings", [])), len(p.get("roads", [])),
          json.dumps(p.get("resources", {}), sort_keys=True))
@@ -705,12 +966,32 @@ def _gameplay_progress_key(state: dict) -> tuple:
         state.get("phase"),
         state.get("round"),
         players_key,
-        trade_key,
     )
 
 
 def _progress_key(state: dict) -> tuple:
     return (*_gameplay_progress_key(state), state.get("game_over"))
+
+
+_ROBBER_LINE_RE = re.compile(r"ROBBER_MOVE\s*[:：]?\s*(h\d{1,2})", re.IGNORECASE)
+_ROBBER_HEX_RE = re.compile(r"\bh(\d{1,2})\b", re.IGNORECASE)
+
+
+def _extract_robber_hex(text: str) -> Optional[str]:
+    """Hex id from the robber owner's end-of-turn prose.
+
+    The prompt asks for a dedicated ``ROBBER_MOVE: h12`` line, which is read
+    first. A bare hex id is still accepted as a fallback so a model that
+    ignores the format is not silently penalized.
+    """
+    if not text:
+        return None
+    match = _ROBBER_LINE_RE.search(text) or _ROBBER_HEX_RE.search(text)
+    if not match:
+        return None
+    # The labelled pattern captures "h12"; the bare fallback captures "12".
+    idx = int(match.group(1).lstrip("hH"))
+    return f"h{idx}" if 0 <= idx <= 18 else None
 
 
 def _extract_agent_reply_text(stdout: str) -> str:
@@ -735,6 +1016,48 @@ def _extract_agent_reply_text(stdout: str) -> str:
         for p in payloads
         if isinstance(p, dict) and isinstance(p.get("text"), str)
     ).strip()
+
+
+def _extract_agent_thinking(stdout: str) -> tuple[int, int]:
+    """Return ``(reasoning_tokens, assistant_turns)`` from ``--json`` CLI stdout.
+
+    Both come from ``result.meta.agentMeta`` (provider usage + completed
+    assistant round trips). Because OpenClaw derives them from each model's own
+    chat-template parsing this stays model/template-neutral across Qwen/GLM/
+    DeepSeek. Returns ``(0, 0)`` when the envelope is missing or partial.
+    """
+    if not stdout:
+        return 0, 0
+    try:
+        data = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError):
+        return 0, 0
+    if not isinstance(data, dict):
+        return 0, 0
+    result = data.get("result")
+    meta = result.get("meta") if isinstance(result, dict) else None
+    agent_meta = meta.get("agentMeta") if isinstance(meta, dict) else None
+    if not isinstance(agent_meta, dict):
+        return 0, 0
+    usage = agent_meta.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    reasoning = usage.get("reasoningTokens") or usage.get("reasoning_tokens")
+    if reasoning is None:
+        for key in ("completion_tokens_details", "output_tokens_details"):
+            details = usage.get(key)
+            if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
+                reasoning = details.get("reasoning_tokens")
+                break
+    turns = agent_meta.get("assistantTurns")
+    try:
+        reasoning = int(reasoning or 0)
+    except (TypeError, ValueError):
+        reasoning = 0
+    try:
+        turns = int(turns or 0)
+    except (TypeError, ValueError):
+        turns = 0
+    return max(0, reasoning), max(0, turns)
 
 
 def _is_no_reply(stdout: str) -> bool:
@@ -783,12 +1106,24 @@ class GameRunner:
     def __init__(self, settings: RunnerSettings):
         self.settings = settings
         self.players = prepare_profiles(settings)
+        self.gateway = build_gateway_runtime(settings)
         self.processes: list[ManagedProcess] = []
         self.mock_clients: list[JsonLineClient] = []
         self.controller: "ControllerClient | None" = None
         self.session_keys: dict[int, str] = {}
         self.delivered_messages: set[tuple[int, int]] = set()
         self._last_agent_stdout: dict[int, str] = {}
+        # Robber opportunity for the current round: which player holds it, and
+        # whether it has already been applied. The engine owns the position;
+        # the scheduler owns who is allowed to move it.
+        self._robber_owner: "int | None" = None
+        # Per-player thinking stats accumulated across agent calls.
+        self._thinking_acc: dict[int, dict[str, int]] = {}
+        # Per-player turn-health (reverse accounting): wakes started
+        # (advances) and the subset whose provisional forfeit was not released.
+        self._wake_count: dict[int, int] = {}
+        self._forfeit_count: dict[int, int] = {}
+        self._pass_count: dict[int, int] = {}
 
     def _initialize_match(self):
         match_dir = self.settings.match_dir
@@ -805,6 +1140,7 @@ class GameRunner:
             "limit": self.settings.limit,
             "game_id": self.settings.game_id,
             "model": self.settings.model,
+            "player_models": {str(k): v for k, v in self.settings.player_models.items()},
             "api_key_env": self.settings.api_key_env,
             "api_key_envs": list(self.settings.api_key_envs),
             "agent_retry_attempts": self.settings.agent_retry_attempts,
@@ -851,14 +1187,52 @@ class GameRunner:
             "--limit", str(self.settings.limit),
             "--state-file", str(self.settings.state_path),
             "--event-log", str(self.settings.engine_event_path),
+            "--language", str(self.settings.language),
+            "--max-illegal-per-wake", str(self.settings.max_illegal_per_wake),
         ]
         if self.settings.teams:
             command += ["--teams", json.dumps(self.settings.teams)]
         if self.settings.map_seed is not None:
             command += ["--map-seed", str(self.settings.map_seed)]
+        if self.settings.mode == "openclaw":
+            command += ["--responder-config", str(self._write_responder_config())]
+            command += ["--trade-timeout",
+                        str(max(60, int(self.settings.agent_timeout_seconds) - 120))]
         return self._start_process(
             "engine", command, self.settings.match_dir / "engine.log", os.environ.copy()
         )
+
+    def _write_responder_config(self) -> Path:
+        """Write the blocking-trade responder-wake config consumed by the engine.
+
+        The engine's trade thread invokes the responder's OpenClaw process
+        (single turn, no tools) using this config: CLI prefix, shared
+        gateway state dir / config path, and the per-player agent id / session
+        key (all players now share one gateway). Only used when mode ==
+        "openclaw" (mock has no agent to wake).
+        """
+        players = {}
+        for player in self.players:
+            players[str(player.player_id)] = {
+                "agent_id": player.agent_id,
+                "session_key": player.session_key,
+                "api_key_env": self.settings.api_key_env_for_player(player.player_id),
+            }
+        config = {
+            "command": self._openclaw_command(),
+            "cwd": str(self.settings.repo_root),
+            "thinking": self.settings.thinking,
+            "timeout": max(60, int(self.settings.agent_timeout_seconds) - 240),
+            "state_dir": str(self.gateway.state_dir),
+            "config_path": str(self.gateway.config_path),
+            "api_key_envs": list(self.settings.api_key_envs),
+            "message_dir": str(self.settings.match_dir),
+            "players": players,
+        }
+        path = self.settings.match_dir / "responder-config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(path, config)
+        return path
 
     def _wait_for_engine(self, engine: ManagedProcess):
         deadline = time.monotonic() + 20
@@ -880,8 +1254,8 @@ class GameRunner:
             for key_env in self.settings.api_key_envs:
                 if key_env != selected:
                     env.pop(key_env, None)
-        env["OPENCLAW_STATE_DIR"] = str(player.state_dir)
-        env["OPENCLAW_CONFIG_PATH"] = str(player.config_path)
+        env["OPENCLAW_STATE_DIR"] = str(self.gateway.state_dir)
+        env["OPENCLAW_CONFIG_PATH"] = str(self.gateway.config_path)
         return env
 
     def _openclaw_command(self, *args: str) -> list[str]:
@@ -919,41 +1293,65 @@ class GameRunner:
             "60000",
             "--json",
         )
-        try:
-            result = subprocess.run(
-                command,
-                cwd=self.settings.repo_root,
-                env=self._player_env(player),
-                capture_output=True,
-                text=True,
-                timeout=90,
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            result = None
+            timed_out = False
+            detail = "unknown gateway error"
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=self.settings.repo_root,
+                    env=self._player_env(player),
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                detail = str(exc)
+
+            if result is not None and result.returncode == 0:
+                try:
+                    payload = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f"Gateway P{player.player_id} {method} returned invalid JSON"
+                    ) from exc
+                if not isinstance(payload, dict) or payload.get("ok") is False:
+                    raise RuntimeError(
+                        f"Gateway P{player.player_id} {method} rejected the request: {payload}"
+                    )
+                return payload
+
+            if result is not None:
+                detail = (
+                    result.stderr.strip()
+                    or result.stdout.strip()
+                    or "unknown gateway error"
+                )[-2000:]
+
+            # The gateway RPC can race startup readiness; retry transport-ish
+            # failures before giving up.
+            if attempt < attempts and _is_transient_gateway_error(detail):
+                time.sleep(5)
+                continue
+            if timed_out:
+                raise RuntimeError(
+                    f"Gateway P{player.player_id} {method} timed out"
+                )
+            raise RuntimeError(
+                f"Gateway P{player.player_id} {method} failed: {detail}"
             )
-        except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"Gateway P{player.player_id} {method} timed out"
-            ) from exc
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "unknown gateway error"
-            raise RuntimeError(
-                f"Gateway P{player.player_id} {method} failed: {detail[-2000:]}"
-            )
-        try:
-            payload = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                f"Gateway P{player.player_id} {method} returned invalid JSON"
-            ) from exc
-        if not isinstance(payload, dict) or payload.get("ok") is False:
-            raise RuntimeError(
-                f"Gateway P{player.player_id} {method} rejected the request: {payload}"
-            )
-        return payload
+        raise RuntimeError(
+            f"Gateway P{player.player_id} {method} failed after {attempts} attempts"
+        )
 
     def _create_player_sessions(self):
         for player in self.players:
             result = self._gateway_call(player, "sessions.create", {
-                "key": self.settings.session_key,
-                "agentId": self.settings.agent_id,
+                "key": player.session_key,
+                "agentId": player.agent_id,
                 "label": f"TradeCraft {self.settings.game_id} P{player.player_id}",
             })
             session_key = result.get("key")
@@ -972,6 +1370,8 @@ class GameRunner:
         if self.settings.mode != "openclaw":
             return
         for message in state.get("messages", []):
+            if str(message.get("kind", "")).startswith("chat"):
+                continue
             message_id = int(message["id"])
             sender = int(message["from"])
             content = str(message["content"])
@@ -990,7 +1390,7 @@ class GameRunner:
                     "chat.inject",
                     {
                         "sessionKey": session_key,
-                        "agentId": self.settings.agent_id,
+                        "agentId": self.players[recipient_id].agent_id,
                         "label": f"TradeCraft message #{message_id} from P{sender}",
                         "message": content,
                     },
@@ -1019,7 +1419,7 @@ class GameRunner:
         for recipient in recipients:
             history = self._gateway_call(self.players[recipient], "chat.history", {
                 "sessionKey": self.session_keys[recipient],
-                "agentId": self.settings.agent_id,
+                "agentId": self.players[recipient].agent_id,
                 "limit": 10,
             })
             serialized = json.dumps(history, ensure_ascii=False)
@@ -1033,7 +1433,43 @@ class GameRunner:
             recipients=recipients,
         )
 
-    def _wait_for_port(self, managed: ManagedProcess, port: int, player: PlayerRuntime | None = None):
+    def _probe_gateway(self, player: PlayerRuntime, timeout_seconds: int = 20) -> bool:
+        """Cheap readiness probe: does the gateway answer a `health` RPC yet?
+
+        The gateway's TCP port can open before its WebSocket/RPC endpoint is
+        ready (channels/sidecars still initialising), which races the first
+        `sessions.create`/`chat.inject` call. Probing `health` avoids that.
+        """
+        command = self._openclaw_command(
+            "gateway",
+            "call",
+            "health",
+            "--params",
+            "{}",
+            "--timeout",
+            str(timeout_seconds * 1000),
+            "--json",
+        )
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.settings.repo_root,
+                env=self._player_env(player),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds + 15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if result.returncode != 0:
+            return False
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(payload, dict) and payload.get("ok") is not False
+
+    def _wait_for_port(self, managed: ManagedProcess, port: int, gateway: GatewayRuntime | None = None):
         deadline = time.monotonic() + self.settings.gateway_startup_seconds
         while time.monotonic() < deadline:
             if managed.process.poll() is not None:
@@ -1043,79 +1479,61 @@ class GameRunner:
                 except OSError:
                     log_tail = "(log unavailable)"
                 diag = ""
-                if player is not None:
-                    # Dump the exact config the gateway rejected, straight to stderr
-                    # (stderr flows into the harness error, unlike state_dir files).
-                    # Print as SINGLE-LINE JSON: multi-line gets interleaved with
-                    # ray log lines at every newline, truncating the dump.
+                if gateway is not None:
+                    # Include the config the gateway rejected (bounded) so a startup
+                    # failure is diagnosable from the raised error alone.
                     try:
-                        cfg_txt = player.config_path.read_text(encoding="utf-8", errors="replace")
-                        try:
-                            cfg_compact = json.dumps(
-                                json.loads(cfg_txt), ensure_ascii=False, separators=(",", ":")
-                            )
-                        except json.JSONDecodeError:
-                            cfg_compact = cfg_txt.replace("\n", " ")
-                        print(f"==GWC==", file=sys.stderr)
-                        print(cfg_compact, file=sys.stderr)
-                        print(f"==ENDGWC==", file=sys.stderr)
-                        diag = f"config:\n{cfg_txt}"
+                        cfg_txt = gateway.config_path.read_text(encoding="utf-8", errors="replace")
+                        diag = f"config:\n{cfg_txt[-4000:]}"
                     except OSError as e:
                         diag = f"(config read failed: {e})"
-                    for name in ("logs/config-audit.jsonl", "logs/gateway.log"):
-                        p = player.state_dir / name
-                        try:
-                            txt = p.read_text(encoding="utf-8", errors="replace")
-                            print(f"==AUDIT {name}==", file=sys.stderr)
-                            print(txt[-4000:].replace("\n", " | "), file=sys.stderr)
-                            diag += f"\n{name}:\n{txt[-4000:]}"
-                        except OSError:
-                            pass
-                    # Recursively walk state_dir to capture the real startup-failure
-                    # bundle (path is version-dependent).
-                    try:
-                        for root, _dirs, files in os.walk(str(player.state_dir)):
-                            for fn in files:
-                                fp = os.path.join(root, fn)
-                                try:
-                                    txt = open(fp, encoding="utf-8", errors="replace").read()
-                                except OSError:
-                                    continue
-                                if not txt.strip():
-                                    continue
-                                print(f"==STATE {fp}==", file=sys.stderr)
-                                print(txt[-3000:].replace("\n", " | "), file=sys.stderr)
-                                diag += f"\n{fp}:\n{txt[-3000:]}"
-                    except OSError:
-                        pass
                 raise RuntimeError(
                     f"{managed.name} exited with code {managed.process.returncode}; "
                     f"log tail:\n{log_tail}\n{diag}"
                 )
             try:
                 with socket.create_connection(("127.0.0.1", port), timeout=0.2):
-                    return
+                    break
             except OSError:
                 time.sleep(0.2)
-        raise TimeoutError(f"Timed out waiting for {managed.name} on port {port}")
+        else:
+            raise TimeoutError(f"Timed out waiting for {managed.name} on port {port}")
+        # TCP can be up before the RPC endpoint actually serves. Probe a cheap
+        # `health` call until the gateway answers so the first real call does
+        # not race startup (best-effort: fall back to `_gateway_call` retries).
+        ready_deadline = time.monotonic() + self.settings.gateway_startup_seconds
+        while time.monotonic() < ready_deadline:
+            if managed.process.poll() is not None:
+                raise RuntimeError(
+                    f"{managed.name} exited with code {managed.process.returncode} "
+                    "during gateway readiness wait; see "
+                    f"{self.settings.match_dir / (managed.name + '.log')}"
+                )
+            if self._probe_gateway(self.players[0]):
+                return
+            time.sleep(1.0)
+        raise TimeoutError(
+            f"Timed out waiting for {managed.name} to become ready on port {port}"
+        )
 
     def _start_gateways(self):
-        for player in self.players:
-            try:
-                with socket.create_connection(("127.0.0.1", player.port), timeout=0.2):
-                    raise RuntimeError(f"Gateway port {player.port} is already in use")
-            except ConnectionRefusedError:
-                pass
-            except TimeoutError:
-                pass
-            command = self._openclaw_command("gateway", "run", "--port", str(player.port))
-            managed = self._start_process(
-                f"gateway-p{player.player_id}",
-                command,
-                self.settings.match_dir / f"gateway-p{player.player_id}.log",
-                self._player_env(player),
-            )
-            self._wait_for_port(managed, player.port, player)
+        """Start the single OpenClaw gateway shared by every player agent."""
+        gateway = self.gateway
+        try:
+            with socket.create_connection(("127.0.0.1", gateway.port), timeout=0.2):
+                raise RuntimeError(f"Gateway port {gateway.port} is already in use")
+        except ConnectionRefusedError:
+            pass
+        except TimeoutError:
+            pass
+        command = self._openclaw_command("gateway", "run", "--port", str(gateway.port))
+        managed = self._start_process(
+            "gateway",
+            command,
+            self.settings.match_dir / "gateway.log",
+            self._player_env(self.players[0]),
+        )
+        self._wait_for_port(managed, gateway.port, gateway)
 
     def _read_state(self) -> dict:
         return _read_json(self.settings.state_path)
@@ -1154,10 +1572,13 @@ class GameRunner:
         for _ in range(limit):
             if goal(self._read_state()):
                 return calls
-            try:
-                calls += self._calls(player_id, invoke_player(player_id))
-            except RuntimeError as exc:
-                self._forfeit_player(player_id, exc)
+            step_calls, ok = self._run_wake(
+                invoke_player,
+                player_id,
+                lambda: goal(self._read_state()),
+            )
+            calls += step_calls
+            if not ok:
                 return calls
             self._after_wake(player_id)
         self._forfeit_player(
@@ -1192,6 +1613,7 @@ class GameRunner:
                 })
         else:
             result = client.request("send_message", {
+                "target": (player_id + 1) % self.settings.players,
                 "content": f"P{player_id} mock action",
             })
         if not result.get("ok"):
@@ -1238,20 +1660,95 @@ class GameRunner:
         )
         return True
 
+    def _accumulate_thinking(self, player_id: int, stdout: str) -> None:
+        """Add one agent call's reasoning-token / assistant-turn counts.
+
+        Persisted to ``thinking.json`` after every call so a partial
+        (crashed/timed-out) match still exposes whatever was observed.
+        """
+        reasoning, turns = _extract_agent_thinking(stdout)
+        if reasoning <= 0 and turns <= 0:
+            return
+        acc = self._thinking_acc.setdefault(
+            player_id, {"reasoning_tokens": 0, "assistant_turns": 0}
+        )
+        acc["reasoning_tokens"] += reasoning
+        acc["assistant_turns"] += turns
+        try:
+            _write_json_compact(self.settings.match_dir / "thinking.json", self.thinking_view())
+        except OSError:
+            pass
+
+    def thinking_view(self) -> dict:
+        """Per-player thinking stats keyed by player id.
+
+        ``avg_thinking_tokens`` is the mean reasoning-token count per completed
+        assistant turn (model/template-neutral, straight from OpenClaw usage).
+        """
+        view: dict = {}
+        for pid, acc in sorted(self._thinking_acc.items()):
+            turns = int(acc.get("assistant_turns", 0) or 0)
+            reasoning = int(acc.get("reasoning_tokens", 0) or 0)
+            view[str(pid)] = {
+                "reasoning_tokens": reasoning,
+                "assistant_turns": turns,
+                "avg_thinking_tokens": (reasoning / turns) if turns > 0 else 0.0,
+            }
+        return view
+
+    def _flush_health(self) -> None:
+        try:
+            _write_json_compact(self.settings.match_dir / "health.json", self.health_view())
+        except OSError:
+            pass
+
+    def health_view(self) -> dict:
+        """Per-player turn health: advances / forfeits / forfeit ratio.
+
+        Reverse accounting: ``advances`` counts every wake *started* for the
+        player, and ``forfeits`` counts the wakes whose provisional charge was
+        never released -- i.e. wakes that did not end correctly (the agent
+        failed, or never yielded and the match timed out before the wake could
+        commit). ``forfeit_ratio`` is therefore the fraction of that player's
+        wakes that failed to drive the turn forward. This ratio is what the
+        reward penalizes, so a wake that runs away is penalized even though it
+        never reached a scheduler forfeit point.
+        """
+        view: dict = {}
+        pids = set(self._wake_count) | set(self._forfeit_count) | set(self._pass_count)
+        # Responder wakes (chat reply / trade response) are driven from the
+        # engine's threads, not this scheduler, so their reverse-accounting
+        # counters live in the engine state and are merged in here. Same spec:
+        # one advance + one provisional forfeit per wake, released only when
+        # the responder finished legally within the illegal budget.
+        legality = self._read_state().get("legality") or {}
+        r_wakes = legality.get("responder_wakes") or []
+        r_forfeits = legality.get("responder_forfeits") or []
+        for pid in range(len(r_wakes)):
+            pids.add(pid)
+        for pid in sorted(pids):
+            adv = int(self._wake_count.get(pid, 0))
+            fft = int(self._forfeit_count.get(pid, 0))
+            if 0 <= pid < len(r_wakes):
+                adv += int(r_wakes[pid])
+            if 0 <= pid < len(r_forfeits):
+                fft += int(r_forfeits[pid])
+            pas = int(self._pass_count.get(pid, 0))
+            view[str(pid)] = {
+                "advances": adv,
+                "forfeits": fft,
+                "passes": pas,
+                "forfeit_ratio": (fft / adv) if adv > 0 else 0.0,
+            }
+        return view
+
     def _build_wake_message(self, player_id: int, view) -> str:
         """Compose the per-wake user prompt from the controller's get_view."""
-        base = (
-            f"You are scheduled now as TradeCraft P{player_id}. Read the game state and any "
-            "step instruction, then use the TradeCraft tools; do not merely explain a move. "
-            "After you complete your scheduled action — a successful trade proposal, a "
-            "placement settlement+road, or any tool call that advances the game — stop "
-            "immediately and return control to the runner by ending your reply without "
-            "calling any further tool. During normal play, tradecraft_send_message is "
-            "available for concrete negotiation such as stating resource needs or "
-            "acceptable terms. If no productive legal action or worthwhile negotiation "
-            "remains, do not call any tool — simply end your reply to end the turn. "
-            "You must always produce an action (a tool call) or an explicit decision — an "
-            "empty or silent reply is never acceptable."
+        base = self.settings.t("wake_scheduled", pid=player_id)
+        base += "\n\n" + self.settings.t(
+            "wake_quota_note",
+            trade_limit=WAKE_TRADE_LIMIT,
+            chat_limit=WAKE_CHAT_LIMIT,
         )
         if view is None:
             return base
@@ -1259,14 +1756,73 @@ class GameRunner:
         instruction = view.get("instruction") or ""
         state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
         events_json = json.dumps(view.get("events", []), ensure_ascii=False, separators=(",", ":"))
+        robber_note = ""
+        if self._robber_owner == player_id and state.get("phase") == "play":
+            robber_note = "\n\n## " + self.settings.t("robber_move_notice")
+        resources_block = self._resources_block(view, state)
         return (
             base
+            + resources_block
             + instruction
-            + "\n\n## Current game state\n"
+            + robber_note
+            + "\n\n## " + self.settings.t("state_header") + "\n"
             + "```json\n" + state_json + "\n```\n"
-            + "## Events since your last turn\n"
+            + "## " + self.settings.t("events_header") + "\n"
             + "```json\n" + events_json + "\n```\n"
         )
+
+    def _resources_block(self, view, state) -> str:
+        """Current resources + what changed since this player's last wake.
+
+        Normally the model would have to diff the event log to answer "what do I
+        hold now?", which is exactly the kind of bookkeeping we do not want to
+        train. The engine already tracks the delta; render it up front.
+        """
+        my_id = state.get("my_player_id")
+        players = state.get("players") or []
+        if not isinstance(my_id, int) or not (0 <= my_id < len(players)):
+            return ""
+        resources = players[my_id].get("resources") or {}
+        delta = state.get("resource_delta_since_last_wake") or {}
+        held = ", ".join(f"{key} {val}" for key, val in resources.items())
+        changed = ", ".join(
+            f"{key} {val:+d}" for key, val in delta.items() if val
+        ) or self.settings.t("resources_delta_none")
+        return (
+            "\n\n## " + self.settings.t("resources_header") + "\n"
+            + held
+            + "\n" + self.settings.t("resources_delta_header") + " " + changed
+        )
+
+    def _apply_pending_robber(self, player_id: int) -> None:
+        """Take this round's robber move out of the owner's end-of-turn prose.
+
+        One attempt only: the opportunity is consumed whether or not a usable
+        hex id was found. A missing target is recorded but never penalized — it
+        is a rule-following miss, not an illegal action.
+        """
+        if self._robber_owner != player_id or self.controller is None:
+            return
+        self._robber_owner = None
+        stdout = self._last_agent_stdout.get(player_id, "")
+        hex_id = _extract_robber_hex(_extract_agent_reply_text(stdout))
+        if not hex_id:
+            # Report the miss to the engine as well: the opportunity is consumed
+            # either way, and the player must see why nothing changed on its next
+            # wake. The engine records ``robber_move_rejected`` in the event log.
+            try:
+                self.controller.move_robber(player_id, "")
+            except RuntimeError:
+                pass
+            self._record("robber_move_missing", player_id=player_id)
+            return
+        try:
+            self.controller.move_robber(player_id, hex_id)
+        except RuntimeError as exc:
+            self._record("robber_move_rejected", player_id=player_id,
+                         hex_id=hex_id, error=str(exc)[-300:])
+            return
+        self._record("robber_moved", player_id=player_id, hex_id=hex_id)
 
     def _invoke_openclaw_agent(self, player_id: int) -> int:
         player = self.players[player_id]
@@ -1277,8 +1833,8 @@ class GameRunner:
         message_file.write_text(message, encoding="utf-8")
         command = self._openclaw_command(
             "agent",
-            "--agent", str(self.settings.agent_id),
-            "--session-key", self.settings.session_key,
+            "--agent", str(player.agent_id),
+            "--session-key", self.session_keys.get(player_id, player.session_key),
             "--message-file", str(message_file),
             "--thinking", self.settings.thinking,
             "--timeout", str(self.settings.agent_timeout_seconds),
@@ -1325,16 +1881,26 @@ class GameRunner:
                 with log_path.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
                 self._last_agent_stdout[player_id] = record["stdout"]
+                self._accumulate_thinking(player_id, record["stdout"])
                 if _is_no_reply(record["stdout"]):
+                    # NO_REPLY is a legitimate player action: "no move this
+                    # wake" (mirrors the prompt's "end without calling a
+                    # tool"). Record it as a pass and let the caller advance
+                    # the wake normally -- never a forfeit.
+                    self._pass_count[player_id] = self._pass_count.get(player_id, 0) + 1
                     self._record(
-                        "agent_no_reply",
+                        "agent_pass",
                         player_id=player_id,
                         attempt=attempt,
+                        reason="no_reply",
                     )
-                    raise AgentNoReply(
-                        f"Player {player_id} returned NO_REPLY on attempt {attempt}"
-                    )
-                return attempt
+                    return attempt
+                if not _agent_envelope_failed(record["stdout"]):
+                    # Clean exit with a normal reply: the wake succeeded. Falling
+                    # through to failure classification here is what produced a
+                    # failure event (and, on a numeric false positive, a full
+                    # re-run) after every single successful agent call.
+                    return attempt
 
             failure_kind = _classify_agent_failure(record)
             retryable = failure_kind in RETRYABLE_AGENT_FAILURES
@@ -1484,9 +2050,31 @@ class GameRunner:
         total = 0
         for _round in range(1, self.settings.max_rounds + 1):
             if self.controller is not None:
+                # Round reset only; each player rolls at their own first wake.
                 self.controller.start_round()
+            self._robber_owner = None
             for pid in range(n):
-                for _ in range(ACTIONS_PER_ROUND):
+                for action_idx in range(ACTIONS_PER_ROUND):
+                    # Personal dice, table-wide settlement: each player rolls
+                    # once per round, at their first scheduled wake.
+                    if action_idx == 0 and self.controller is not None:
+                        roll_info = self.controller.roll_for_player(pid)
+                        self._record(
+                            "dice_roll",
+                            player_id=pid,
+                            round=_round,
+                            roll=roll_info.get("roll"),
+                            deltas=roll_info.get("deltas"),
+                        )
+                        if roll_info.get("robber_triggered"):
+                            # The roller owns the robber move for this 7.
+                            self._robber_owner = pid
+                            self._record(
+                                "robber_opportunity",
+                                player_id=pid,
+                                round=_round,
+                                roll=roll_info.get("roll"),
+                            )
                     state = self._read_state()
                     if state.get("game_over"):
                         return total
@@ -1496,8 +2084,8 @@ class GameRunner:
                         phase=state.get("phase"),
                         round=state.get("round"),
                     )
-                    total += self._resolve_pending_trade(invoke_player)
                     total += self._drive_play_action(invoke_player, pid)
+                    self._apply_pending_robber(pid)
             # One complete round just finished (every player took their
             # ACTIONS_PER_ROUND actions). Record the score snapshot so a
             # long-round match that stalls later can still settle on this
@@ -1507,47 +2095,98 @@ class GameRunner:
         return total
 
     def _drive_play_action(self, invoke_player, player_id: int) -> int:
-        try:
-            calls = self._calls(player_id, invoke_player(player_id))
-        except RuntimeError as exc:
-            self._forfeit_player(player_id, exc)
+        baseline = _gameplay_progress_key(self._read_state())
+        calls, ok = self._run_wake(
+            invoke_player,
+            player_id,
+            lambda: _gameplay_progress_key(self._read_state()) != baseline,
+        )
+        if not ok:
             return 1
         self._after_wake(player_id)
         return calls
 
+    def _begin_wake(self, player_id: int) -> None:
+        """Reverse accounting: pre-charge one wake as an advance + a forfeit.
+
+        Called immediately before a wake is driven. The advance is counted up
+        front so ``advances`` can never be zero for a player that actually woke
+        (which would collapse ``forfeit_ratio`` to 0), and the forfeit is
+        provisional: ``_commit_wake`` releases it only once the wake verifiably
+        ended correctly. A wake that never yields -- the agent keeps acting
+        until the outer match timeout kills the match -- therefore keeps its
+        pre-charge and is counted as a forfeit.
+        """
+        self._wake_count[player_id] = self._wake_count.get(player_id, 0) + 1
+        self._forfeit_count[player_id] = self._forfeit_count.get(player_id, 0) + 1
+        self._flush_health()
+
+    def _commit_wake(self, player_id: int) -> None:
+        """Release the provisional forfeit for a wake that ended correctly."""
+        current = self._forfeit_count.get(player_id, 0)
+        if current > 0:
+            self._forfeit_count[player_id] = current - 1
+        self._flush_health()
+
+    def _player_illegal(self, player_id: int) -> int:
+        """This player's cumulative ``legality.illegal_actions`` (0 if absent)."""
+        legality = self._read_state().get("legality") or {}
+        values = legality.get("illegal_actions") or []
+        if 0 <= player_id < len(values):
+            return int(values[player_id])
+        return 0
+
+    @staticmethod
+    def _wake_over_budget(illegal_before: int, illegal_after: int, budget: int) -> bool:
+        """True when one wake exceeded its illegal/over-action budget.
+
+        Spinning past the wake's single scheduled action is *not* free: the
+        engine counts each such call as illegal (``noop_actions`` is the subset),
+        and a wake that overruns the budget keeps its provisional forfeit -- so
+        the spin lands in ``forfeit_ratio`` and the reward penalizes it through
+        ``forfeit_penalty`` only, never through a separate reward term (§7.4.1).
+        """
+        return (int(illegal_after) - int(illegal_before)) > max(0, int(budget))
+
+    def _run_wake(self, invoke_player, player_id: int, progressed):
+        """Drive one reverse-accounted wake.
+
+        Pre-charges the wake (advance + provisional forfeit), invokes the agent
+        once, then releases the provisional forfeit iff the wake ended correctly
+        -- either it verifiably advanced the game (``progressed()`` is true) or
+        the agent returned a legal NO_REPLY pass -- *and* the wake stayed within
+        the per-wake illegal/over-action budget. Returns ``(calls, ok)``; ``ok``
+        is False when the agent failed, in which case the wake stays a forfeit.
+        """
+        self._begin_wake(player_id)
+        passes_before = int(self._pass_count.get(player_id, 0))
+        illegal_before = self._player_illegal(player_id)
+        try:
+            calls = self._calls(player_id, invoke_player(player_id))
+        except RuntimeError as exc:
+            self._forfeit_player(player_id, exc)
+            return 1, False
+        passed = int(self._pass_count.get(player_id, 0)) > passes_before
+        over_budget = self._wake_over_budget(
+            illegal_before,
+            self._player_illegal(player_id),
+            self.settings.max_illegal_per_wake,
+        )
+        if (passed or progressed()) and not over_budget:
+            self._commit_wake(player_id)
+        return calls, True
+
     def _after_wake(self, player_id: int):
-        """Post-wake bookkeeping: deliver pending chat, advance event pointer."""
+        """Post-wake bookkeeping: deliver pending chat, advance event pointer.
+
+        The wake's advance is already counted by ``_begin_wake`` (reverse
+        accounting); this only delivers messages and advances the engine turn.
+        """
+        self._flush_health()
         state = self._read_state()
         self._deliver_pending_messages(state)
         if self.controller is not None and not state.get("game_over"):
             self.controller.advance(player_id)
-
-    def _resolve_pending_trade(self, invoke_player) -> int:
-        """Awaken the pending trade's responder to decide, then resolve it.
-
-        The responder decision is an extra wake that does not consume the
-        responder's action quota. Returns the number of agent calls spent.
-        """
-        state = self._read_state()
-        pending = state.get("pending_trade")
-        if not pending:
-            return 0
-        responder = int(pending["responder"])
-        if self.settings.mode == "mock":
-            if self.controller is not None:
-                self.controller.resolve_trade(
-                    "reject", "Mock responder declines this offer."
-                )
-            return 0
-        try:
-            calls = self._calls(responder, invoke_player(responder))
-        except RuntimeError as exc:
-            # forfeit auto-rejects the pending trade on the responder's behalf.
-            self._forfeit_player(responder, exc)
-            return 1
-        self._after_wake(responder)
-        self._resolve_trade_response(responder)
-        return calls
 
     def _forfeit_player(self, player_id: int, exc: RuntimeError) -> int:
         """Record a scheduler-driven forfeit after an agent failure.
@@ -1563,6 +2202,9 @@ class GameRunner:
             reason="no_reply" if isinstance(exc, AgentNoReply) else "failure",
             error=f"{type(exc).__name__}: {str(exc)[:300]}",
         )
+        # Reverse accounting: the wake was pre-charged by ``_begin_wake``; leave
+        # that provisional forfeit standing and only tap the engine below.
+        self._flush_health()
         if self.controller is None:
             raise RuntimeError(
                 f"No controller to forfeit player {player_id}: {exc}"
@@ -1576,36 +2218,6 @@ class GameRunner:
         )
         return 1
 
-    def _resolve_trade_response(self, player_id: int) -> dict:
-        """Parse the responder's JSON decision and submit it to the engine.
-
-        The responder expresses its accept/reject decision as a JSON object in its
-        final message text instead of calling a tool. On any parse failure the
-        decision is treated as a rejection with a system-supplied reason.
-
-        A rejected resolution (``ok: False``) is a normal in-game outcome — e.g.
-        the proposer no longer holds the offered resources at execution time. The
-        scheduler treats it as a responder forfeit instead of crashing the match.
-        """
-        stdout = self._last_agent_stdout.get(player_id, "")
-        decision, reason = _extract_trade_decision(stdout)
-        result = self.controller.resolve_trade(decision, reason)
-        self._record(
-            "trade_response",
-            player_id=player_id,
-            decision=decision,
-            reason=reason,
-            ok=result.get("ok"),
-        )
-        if not result.get("ok"):
-            self._forfeit_player(
-                player_id,
-                RuntimeError(
-                    f"trade resolution rejected: {result.get('error')}"
-                ),
-            )
-        return result
-
     def _settle_match(self, total_calls: int) -> dict:
         """Explicitly settle a finished match and return the final state.
 
@@ -1618,15 +2230,6 @@ class GameRunner:
         if self.controller is None:
             raise RuntimeError(
                 "No controller connection available to settle the match"
-            )
-        # A trade proposed on the final action of the last round has no further
-        # responder wake to resolve it. The engine rejects settlement while a
-        # pending trade is unresolved, so auto-reject any trailing trade before
-        # settling (the match is over; the responder can never act again).
-        state = self._read_state()
-        if state.get("pending_trade") and not state.get("game_over"):
-            self.controller.resolve_trade(
-                "reject", "Match ended; pending trade auto-rejected."
             )
         final = self.controller.settle()
         self._record(
@@ -1801,9 +2404,17 @@ def main() -> int:
         )
         if args.prepare_only:
             players = prepare_profiles(settings)
-            print(f"Prepared {len(players)} player profiles under {settings.profile_root}")
+            gateway = build_gateway_runtime(settings)
+            print(
+                f"Prepared 1 gateway + {len(players)} player agents under "
+                f"{settings.profile_root}"
+            )
+            print(f"gateway: {gateway.config_path}")
             for player in players:
-                print(f"P{player.player_id}: {player.config_path}")
+                print(
+                    f"P{player.player_id}: agent={player.agent_id} "
+                    f"session={player.session_key}"
+                )
             return 0
 
         runner = GameRunner(settings)
@@ -1817,14 +2428,27 @@ def main() -> int:
             return 0
 
         final_state = runner.run()
+        if not isinstance(final_state, dict):
+            final_state = runner._read_state()
+        # The reward module decides "did this match settle?" from the global
+        # round count (round_eff > settlement_round_threshold). The settled
+        # snapshot carries it, but it was omitted from this payload, so every
+        # match scored as a short match (flat short_base). Forward it.
+        settled_round = final_state.get("round")
+        if settled_round is None:
+            settled_round = runner._read_state().get("round")
         print(json.dumps({
             "game_id": settings.game_id,
+            "round": settled_round,
+            "max_rounds": final_state.get("max_rounds", settings.max_rounds),
             "winner": final_state.get("winner"),
             "scores": final_state.get("scores"),
             "teams": final_state.get("teams"),
             "team_scores": final_state.get("team_scores"),
             "team_winner": final_state.get("team_winner"),
             "legality": final_state.get("legality"),
+            "thinking": runner.thinking_view(),
+            "health": runner.health_view(),
             "artifacts": str(settings.match_dir),
         }, ensure_ascii=False, indent=2))
         return 0

@@ -23,11 +23,26 @@
         "default": "/tmp/tradecraft.sock",
         "description": "Unix socket path for the TradeCraft game engine."
       },
+      "playerIds": {
+        "type": "array",
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "description": "Player ids (0-3) whose engine connections this gateway opens eagerly at startup. In single-gateway mode all players are served by one gateway, so list every seat here."
+      },
       "playerId": {
         "type": "integer",
         "minimum": 0,
         "maximum": 3,
-        "description": "Player identity (0-3, within the engine's configured player count). Defaults to TRADECRAFT_PLAYER_ID env var."
+        "description": "Static player identity (0-3) for single-agent setups. Prefer playerIds; per-call player identity is otherwise resolved from the agent/session runtime context. Defaults to TRADECRAFT_PLAYER_ID env var."
+      },
+      "language": {
+        "type": "string",
+        "enum": ["en", "zh", "fr", "es", "ru", "ar"],
+        "default": "en",
+        "description": "Language for agent-facing tool labels/descriptions (UN languages). Protocol values stay English."
       }
     }
   },
@@ -36,9 +51,17 @@
       "label": "Socket Path",
       "help": "Unix socket path for the TradeCraft game engine daemon."
     },
+    "playerIds": {
+      "label": "Player IDs",
+      "help": "Player ids served by this gateway (0-3); their engine connections open at startup."
+    },
     "playerId": {
       "label": "Player ID",
-      "help": "Which player this agent controls (0-3)."
+      "help": "Static player identity for single-agent setups (0-3)."
+    },
+    "language": {
+      "label": "Language",
+      "help": "Agent-facing tool description language (en/zh/fr/es/ru/ar)."
     }
   }
 }

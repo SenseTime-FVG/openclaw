@@ -1,25 +1,77 @@
 {
   "gameId": "",
-  "maxAgentCalls": 200,
-  "maxAgentCallsWithoutProgress": 3,
-  "mode": "mock",
+  "mode": "openclaw",
+  "players": 3,
+  "maxRounds": 5,
+  "seed": 42,
+  "language": "en",
+  "maxAgentCalls": 120,
+  "maxAgentCallsWithoutProgress": 4,
   "openclaw": {
     "agentId": "main",
-    "agentRetryAttempts": 3,
+    "model": "example/model-id",
+    "basePort": 19789,
+    "portStep": 20,
+    "agentTimeoutSeconds": 600,
+    "agentRetryAttempts": 2,
     "agentRetryBaseSeconds": 5,
     "agentRetryMaxSeconds": 60,
-    "agentTimeoutSeconds": 600,
-    "apiKeyEnv": "",
-    "apiKeyEnvs": [],
-    "basePort": 18789,
-    "configOverlay": {},
-    "gatewayStartupSeconds": 90,
-    "model": "",
-    "portStep": 20,
-    "rateLimitMaxWaitSeconds": 3600,
     "rateLimitRetrySeconds": 120,
-    "thinking": "low"
-  },
-  "players": 3,
-  "seed": 42
+    "rateLimitMaxWaitSeconds": 3600,
+    "thinking": "off",
+    "gatewayStartupSeconds": 120,
+    "agentsSchema": "entries",
+    "apiKeyEnv": "PROVIDER_API_KEY",
+    "configOverlay": {
+      "models": {
+        "mode": "replace",
+        "providers": {
+          "example": {
+            "baseUrl": "https://your-endpoint.example.com/compatible-mode/v1",
+            "api": "openai-completions",
+            "apiKey": "${PROVIDER_API_KEY}",
+            "models": [
+              {
+                "id": "model-id",
+                "name": "model-id",
+                "input": [
+                  "text"
+                ],
+                "contextWindow": 262144
+              }
+            ]
+          }
+        }
+      },
+      "plugins": {
+        "load": {
+          "paths": [
+            "/path/to/openclaw-26.7.1/extensions/tradecraft"
+          ]
+        },
+        "entries": {
+          "memory-core": {
+            "enabled": true,
+            "config": {
+              "dreaming": {
+                "enabled": false
+              }
+            }
+          }
+        }
+      },
+      "tools": {
+        "deny": [
+          "exec",
+          "write",
+          "edit",
+          "apply_patch",
+          "web_search",
+          "web_fetch",
+          "browser",
+          "image"
+        ]
+      }
+    }
+  }
 }

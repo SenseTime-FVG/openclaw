@@ -6,21 +6,44 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 TOTAL_ROUNDS = 12
-ACTIONS_PER_ROUND = 2
-ACTION_LIMIT = 3
+ACTIONS_PER_ROUND = 1
+ACTION_LIMIT = 3  # legacy knob, unused by pacing
+
+# Per-wake quotas. One wake may contain at most this many of each kind:
+# build and claim_project share one slot (mutual exclusion), while the free
+# negotiation steps get a small allowance so a wake cannot loop on them.
+WAKE_ACTION_LIMIT = 1
+WAKE_TRADE_LIMIT = 3
+WAKE_CHAT_LIMIT = 3
 MAX_SETTLEMENTS = 5
 MAX_CITIES = 3
 MAX_ROADS = 12
 MIN_SETTLEMENT_DISTANCE = 2
 
-RESOURCES = ["wood", "stone", "iron", "crystal", "silk"]
-GOLD_RESOURCE = "gold"
+# Catan base-game resource set. Five resources, no "wildcard" resource: the
+# only source of flexibility is the bank/port ratio trade, which always costs
+# more than a player-to-player swap (that asymmetry is what creates bargaining).
+RESOURCES = ["wood", "brick", "sheep", "wheat", "ore"]
 DESERT = "desert"
-RESOURCE_POOL = (["wood"]*3 + ["stone"]*3 + ["iron"]*3
-                 + ["crystal"]*3 + ["silk"]*3 + ["gold"]*2 + ["desert"]*2)
-DICE_DISTRIBUTION = [(2,1),(3,2),(4,2),(5,2),(6,2),(8,2),(9,2),(10,2),(11,1),(12,1)]
+# Base Catan terrain mix: 4 forest, 3 brick, 4 pasture, 4 field, 3 mountain,
+# 1 desert = 19 hexes. The desert is pinned to the centre hex.
+RESOURCE_POOL = (["wood"]*4 + ["brick"]*3 + ["sheep"]*4
+                 + ["wheat"]*4 + ["ore"]*3)
+# Base Catan number tokens: one each of 2 and 12, two each of 3..6 and 8..11
+# = 18 tokens for the 18 non-desert hexes. 7 is deliberately absent.
+DICE_DISTRIBUTION = [(2,1),(3,2),(4,2),(5,2),(6,2),(8,2),(9,2),(10,2),(11,2),(12,1)]
 HEX_ROWS = [3, 4, 5, 4, 3]
 RED_NUMBERS = {6, 8}  # Catan "red number" tokens: may not sit adjacent
+
+# Centre hex (row, col) is always desert and hosts the robber at match start.
+CENTER_CELL = (2, 2)
+# The six corner hexes of the radius-2 board. Each has exactly two vertices
+# that touch no other hex — those twelve vertices are the generic ports.
+CORNER_CELLS = [(0, 0), (0, 2), (2, 0), (2, 4), (4, 0), (4, 2)]
+
+# Bank trade ratios: 4:1 normally, 3:1 when the trader owns a port vertex.
+BANK_RATE_DEFAULT = 4
+BANK_RATE_PORT = 3
 
 # 6 uniform neighbor directions in cube coords
 CUBE_DIRS = [(1,-1,0),(1,0,-1),(0,1,-1),(-1,1,0),(-1,0,1),(0,-1,1)]
@@ -61,9 +84,21 @@ class Edge:
 class GameMap:
     hexes: list[HexTile]; vertices: list[Vertex]; edges: list[Edge]
     seed: int; dice_sequence: list[int] = field(default_factory=list)
+    ports: list[str] = field(default_factory=list)
+    robber_start: str = ""
     def hex_by_id(self, hid): return next(h for h in self.hexes if h.id == hid)
     def vertex_by_id(self, vid): return next(v for v in self.vertices if v.id == vid)
     def edge_by_id(self, eid): return next(e for e in self.edges if e.id == eid)
+
+
+def cell_to_hex_id(r: int, c: int) -> str:
+    """Row-major hex id for a (row, col) board cell."""
+    idx = 0
+    for row, count in enumerate(HEX_ROWS):
+        if row == r:
+            return f"h{idx + c}"
+        idx += count
+    raise ValueError(f"cell out of board: {(r, c)}")
 
 
 def _build_topology(hex_cubes: dict[tuple, int]):
@@ -198,12 +233,13 @@ def _assign_anticlustered(items: list, positions: list[int],
     return None
 
 
-def generate_map(seed=42, total_rounds=TOTAL_ROUNDS, map_seed=None):
+def generate_map(seed=42, total_rounds=TOTAL_ROUNDS, map_seed=None, num_players=4):
     """Generate a balanced map. ``map_seed`` (optional) independently controls
     the resource/number layout; ``seed`` controls the dice sequence (and is the
     fallback map seed when ``map_seed`` is None, keeping old behavior intact).
 
     Balance (b-mode) is always applied:
+      * the centre hex is always desert (robber's starting hex);
       * resource anti-clustering — same resource never on adjacent hexes;
       * number balancing — red numbers (6, 8) never adjacent.
     """
@@ -212,21 +248,25 @@ def generate_map(seed=42, total_rounds=TOTAL_ROUNDS, map_seed=None):
 
     adj = _hex_adjacency()
     positions = list(adj.keys())  # 0..18
+    center_idx = int(cell_to_hex_id(*CENTER_CELL)[1:])
+    resource_positions = [p for p in positions if p != center_idx]
 
-    # 1) resources: anti-cluster same resources
-    res_ass = _assign_anticlustered(list(RESOURCE_POOL), positions,
+    # 1) resources: anti-cluster same resources; the centre stays desert so it
+    # never carries a number token and never produces.
+    res_ass = _assign_anticlustered(list(RESOURCE_POOL), resource_positions,
                                     lambda a, b: a == b, map_rng)
     if res_ass is None:
         # fallback: plain shuffle (should be vanishingly rare)
         res = list(RESOURCE_POOL)
         map_rng.shuffle(res)
-        res_ass = {p: res[i] for i, p in enumerate(positions)}
+        res_ass = {p: res[i] for i, p in enumerate(resource_positions)}
+    res_ass[center_idx] = DESERT
 
     # 2) numbers: red numbers (6,8) never adjacent
     numbers = []
     for num, cnt in DICE_DISTRIBUTION:
         numbers.extend([num]*cnt)
-    non_desert = [p for p in positions if res_ass[p] != DESERT]
+    non_desert = [p for p in resource_positions]
     num_ass = _assign_anticlustered(numbers, non_desert,
                                     lambda a, b: a in RED_NUMBERS and b in RED_NUMBERS,
                                     map_rng)
@@ -251,11 +291,21 @@ def generate_map(seed=42, total_rounds=TOTAL_ROUNDS, map_seed=None):
 
     vertices, edges = _build_topology(hex_cubes)
 
+    # Ports: the two single-hex vertices of each of the six corner hexes.
+    ports: list[str] = []
+    for r, c in CORNER_CELLS:
+        hid = cell_to_hex_id(r, c)
+        vs = [v.id for v in vertices if hid in v.hexes and len(v.hexes) == 1]
+        ports.extend(sorted(vs, key=lambda x: int(x[1:])))
+
+    # One production roll per player per round: each player rolls once at their
+    # first wake of the round, and every roll settles for the whole table.
     dice_seq = [dice_rng.randint(1, 6) + dice_rng.randint(1, 6)
-                for _ in range(total_rounds * 2)]
+                for _ in range(total_rounds * num_players)]
 
     return GameMap(hexes=hexes, vertices=vertices, edges=edges, seed=seed,
-                   dice_sequence=dice_seq)
+                   dice_sequence=dice_seq, ports=ports,
+                   robber_start=cell_to_hex_id(*CENTER_CELL))
 
 
 def compact_map_view(game_map: GameMap) -> dict:
@@ -264,6 +314,7 @@ def compact_map_view(game_map: GameMap) -> dict:
         "hexes": {h.id: [h.resource, h.number] for h in game_map.hexes},
         "vertices": {v.id: list(v.hexes) for v in game_map.vertices},
         "edges": {e.id: [e.v1, e.v2] for e in game_map.edges},
+        "ports": list(game_map.ports),
     }
 
 

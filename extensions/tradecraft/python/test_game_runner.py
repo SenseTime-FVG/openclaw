@@ -216,7 +216,7 @@ class GameRunnerTest(unittest.TestCase):
             command = run.call_args_list[0].args[0]
             wake_message = (settings.match_dir / "wake-p0.txt").read_text(encoding="utf-8")
             self.assertIn("Read the game state and any step instruction", wake_message)
-            self.assertIn("a successful trade proposal", wake_message)
+            self.assertIn("a successful build", wake_message)
             self.assertIn("stop immediately", wake_message)
             self.assertIn("tradecraft_send_message is available for concrete negotiation", wake_message)
             self.assertIn("do not call any tool — simply end your reply to end the turn", wake_message)
@@ -462,7 +462,7 @@ class GameRunnerTest(unittest.TestCase):
             self.assertTrue(final_state["game_over"])
             self.assertEqual(final_state["round"], 12)
             self.assertEqual(final_state["max_rounds"], 12)
-            self.assertEqual(len(final_state["dice_rolls"]), 2)
+            self.assertEqual(len(final_state["dice_this_round"]), 3)
             self.assertEqual(len(final_state["scores"]), 3)
             self.assertTrue(settings.engine_event_path.exists())
             self.assertTrue(settings.runner_event_path.exists())

@@ -20,6 +20,7 @@ export interface EngineResponse {
   ok: boolean;
   result?: unknown;
   error?: string;
+  turn_over?: boolean;
 }
 
 /**
@@ -263,4 +264,80 @@ export function resolveSocketPath(pluginConfig?: Record<string, unknown>): strin
     return pluginConfig.socketPath as string;
   }
   return process.env.TRADECRAFT_SOCKET ?? "/tmp/tradecraft.sock";
+}
+
+// ── Player identity from the runtime agent/session context ────────────
+//
+// A single OpenClaw gateway now hosts one agent per player, so player
+// identity is no longer baked into a per-gateway config. The plugin tool
+// factory receives the active agent/session in its context; we map that to
+// the TradeCraft player id (0-3) at request time.
+
+const AGENT_PLAYER_RE = /^p?(\d{1,2})$/i;
+const SESSION_AGENT_RE = /^agent:([^:]+)/i;
+
+/** Parse a player id (0-3) from an agent id such as "p0" / "P1". */
+export function playerIdFromAgentId(agentId?: string | null): number | null {
+  if (typeof agentId !== "string") {
+    return null;
+  }
+  const match = AGENT_PLAYER_RE.exec(agentId.trim());
+  if (!match) {
+    return null;
+  }
+  const id = parseInt(match[1], 10);
+  return Number.isInteger(id) && id >= 0 && id <= 3 ? id : null;
+}
+
+/** Parse a player id from a session key such as "agent:p0:tradecraft-...". */
+export function playerIdFromSessionKey(sessionKey?: string | null): number | null {
+  if (typeof sessionKey !== "string") {
+    return null;
+  }
+  const match = SESSION_AGENT_RE.exec(sessionKey.trim());
+  if (!match) {
+    return null;
+  }
+  return playerIdFromAgentId(match[1]);
+}
+
+/**
+ * Resolve which player the current tool call belongs to.
+ *
+ * Prefers the runtime agent id (``ctx.agentId``), then the session key
+ * (``ctx.sessionKey``), and finally falls back to the static
+ * ``playerId``/``TRADECRAFT_PLAYER_ID`` config for single-agent setups.
+ */
+export function resolvePlayerIdFromContext(
+  ctx: { agentId?: string | null; sessionKey?: string | null } | undefined,
+  pluginConfig?: Record<string, unknown>,
+): number {
+  const fromAgent = playerIdFromAgentId(ctx?.agentId);
+  if (fromAgent !== null) {
+    return fromAgent;
+  }
+  const fromSession = playerIdFromSessionKey(ctx?.sessionKey);
+  if (fromSession !== null) {
+    return fromSession;
+  }
+  return resolvePlayerId(pluginConfig);
+}
+
+/**
+ * Player ids whose engine connections this gateway should open eagerly at
+ * plugin load, so the scheduler's "all players registered" gate is met before
+ * any agent turn runs. Falls back to the static ``playerId``.
+ */
+export function resolveConfiguredPlayerIds(pluginConfig?: Record<string, unknown>): number[] {
+  const raw = pluginConfig?.playerIds;
+  if (Array.isArray(raw)) {
+    const ids = raw
+      .map((value) => (typeof value === "number" ? value : parseInt(String(value), 10)))
+      .filter((value) => Number.isInteger(value) && value >= 0 && value <= 3);
+    const unique = Array.from(new Set(ids)).sort((a, b) => a - b);
+    if (unique.length > 0) {
+      return unique;
+    }
+  }
+  return [resolvePlayerId(pluginConfig)];
 }

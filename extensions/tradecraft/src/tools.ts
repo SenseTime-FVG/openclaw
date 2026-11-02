@@ -1,14 +1,16 @@
 /** TradeCraft tool schemas for the Catan-style engine protocol. */
 import { Type } from "typebox";
 
+// A zero (or omitted) amount means "this resource is not part of the trade".
+// The engine strips zeros, so a two-resource swap is legal without padding all
+// five keys; only the engine rejects a side that ends up empty.
 const ResourceMap = Type.Object(
   {
-    wood: Type.Optional(Type.Integer({ minimum: 1 })),
-    stone: Type.Optional(Type.Integer({ minimum: 1 })),
-    iron: Type.Optional(Type.Integer({ minimum: 1 })),
-    crystal: Type.Optional(Type.Integer({ minimum: 1 })),
-    silk: Type.Optional(Type.Integer({ minimum: 1 })),
-    gold: Type.Optional(Type.Integer({ minimum: 1 })),
+    wood: Type.Optional(Type.Integer({ minimum: 0 })),
+    brick: Type.Optional(Type.Integer({ minimum: 0 })),
+    sheep: Type.Optional(Type.Integer({ minimum: 0 })),
+    wheat: Type.Optional(Type.Integer({ minimum: 0 })),
+    ore: Type.Optional(Type.Integer({ minimum: 0 })),
   },
   { additionalProperties: false },
 );
@@ -23,24 +25,29 @@ export const BuildSchema = Type.Object({
 export const ProposeTradeSchema = Type.Object({
   offer: ResourceMap,
   request: ResourceMap,
-  target: Type.Optional(Type.Integer({ minimum: 0, maximum: 3 })),
-});
-
-export const RespondTradeSchema = Type.Object({
-  action: Type.String({ enum: ["accept", "reject", "counter"] }),
-  message: Type.String({
-    minLength: 1,
-    description:
-      "Concise decision or negotiation feedback delivered to the other party without consuming a turn action.",
-  }),
-  offer: Type.Optional(ResourceMap),
-  request: Type.Optional(ResourceMap),
+  target: Type.Optional(
+    Type.Union(
+      [Type.Integer({ minimum: 0, maximum: 3 }), Type.Literal("system")],
+      {
+        description:
+          "Player id (0-3) to trade with, or \"system\" for the bank/port exchange: " +
+          "give a fixed ratio of ONE resource for 1 of another. The ratio is 4:1, " +
+          "or 3:1 if you own a building on a port vertex. No counterparty has to agree.",
+      },
+    ),
+  ),
 });
 
 export const SendMessageSchema = Type.Object({
+  target: Type.Integer({
+    minimum: 0,
+    maximum: 3,
+    description: "Player id (0-3) to send this private message to.",
+  }),
   content: Type.String({
     minLength: 1,
-    description: "Message broadcast to every other player in the match.",
+    description:
+      "Private message delivered to the target player, who is woken to reply within the same round.",
   }),
 });
 
